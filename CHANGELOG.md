@@ -88,3 +88,4 @@
 - `0.5.12` Start CLI binary uploads to S3.
 - `0.5.13` Add Cursor Plugins and Opencode support. Bug fix in skill serialization. Agent guard installer detects unauthorized modifications of the hooks script. Agent guard installer installs hooks only if requested agents are already installed on the machine.
 - `0.5.14` Fix --insecure usage with the Snyk CLI. Remove unused API calls.
+- `0.5.15` Fix false error triggering on skipping guard installations on missing agents.
