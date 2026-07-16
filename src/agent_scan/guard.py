@@ -204,8 +204,8 @@ def _run_install(args) -> None:
                 f"Skipping hook installation for {_client_label(c)}."
             )
         if not clients:
-            rich.print("[bold red]Error:[/bold red] No installed agents found. Nothing to install.")
-            sys.exit(1)
+            rich.print("[yellow]Warning:[/yellow] No installed agents found. Nothing to install.")
+            return
 
     scope = "managed" if managed else "user"
     snyk_token = ""

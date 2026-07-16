@@ -2731,22 +2731,21 @@ class TestRunInstallSkipsUninstalledClients:
     @patch("agent_scan.guard._install_hooks")
     @patch("agent_scan.guard.mint_push_key", return_value="minted-pk")
     @patch("agent_scan.guard.fetch_guard_enabled", return_value=True)
-    def test_single_client_not_installed_exits(
+    def test_single_client_not_installed_returns_gracefully(
         self, mock_fetch, mock_mint, mock_install, tmp_path, monkeypatch, capsys
     ):
         monkeypatch.delenv("PUSH_KEY", raising=False)
         monkeypatch.setenv("SNYK_TOKEN", "tok")
         with patch("agent_scan.guard._CLIENT_INSTALL_PATHS", self._fake_paths(tmp_path, [])):
-            with pytest.raises(SystemExit):
-                _run_install(
-                    SimpleNamespace(
-                        client="claude",
-                        url="https://api.snyk.io",
-                        tenant_id="tid-1",
-                        file=None,
-                        managed=False,
-                    )
+            _run_install(
+                SimpleNamespace(
+                    client="claude",
+                    url="https://api.snyk.io",
+                    tenant_id="tid-1",
+                    file=None,
+                    managed=False,
                 )
+            )
         mock_mint.assert_not_called()
         mock_install.assert_not_called()
         out = capsys.readouterr().out
@@ -2755,20 +2754,21 @@ class TestRunInstallSkipsUninstalledClients:
     @patch("agent_scan.guard._install_hooks")
     @patch("agent_scan.guard.mint_push_key", return_value="minted-pk")
     @patch("agent_scan.guard.fetch_guard_enabled", return_value=True)
-    def test_all_clients_none_installed_exits(self, mock_fetch, mock_mint, mock_install, tmp_path, monkeypatch, capsys):
+    def test_all_clients_none_installed_returns_gracefully(
+        self, mock_fetch, mock_mint, mock_install, tmp_path, monkeypatch, capsys
+    ):
         monkeypatch.delenv("PUSH_KEY", raising=False)
         monkeypatch.setenv("SNYK_TOKEN", "tok")
         with patch("agent_scan.guard._CLIENT_INSTALL_PATHS", self._fake_paths(tmp_path, [])):
-            with pytest.raises(SystemExit):
-                _run_install(
-                    SimpleNamespace(
-                        client="all",
-                        url="https://api.snyk.io",
-                        tenant_id="tid-1",
-                        file=None,
-                        managed=False,
-                    )
+            _run_install(
+                SimpleNamespace(
+                    client="all",
+                    url="https://api.snyk.io",
+                    tenant_id="tid-1",
+                    file=None,
+                    managed=False,
                 )
+            )
         mock_mint.assert_not_called()
         mock_install.assert_not_called()
         out = capsys.readouterr().out
@@ -2804,17 +2804,18 @@ class TestRunInstallSkipsUninstalledClients:
         monkeypatch.setenv("PUSH_KEY", "headless-pk")
         monkeypatch.setenv("TENANT_ID", "tid-hl")
         with patch("agent_scan.guard._CLIENT_INSTALL_PATHS", self._fake_paths(tmp_path, [])):
-            with pytest.raises(SystemExit):
-                _run_install(
-                    SimpleNamespace(
-                        client="cursor",
-                        url="https://api.snyk.io",
-                        tenant_id="",
-                        file=None,
-                        managed=False,
-                    )
+            _run_install(
+                SimpleNamespace(
+                    client="cursor",
+                    url="https://api.snyk.io",
+                    tenant_id="",
+                    file=None,
+                    managed=False,
                 )
+            )
         mock_install.assert_not_called()
+        out = capsys.readouterr().out
+        assert "not installed" in out.lower()
 
     @patch("agent_scan.guard._install_hooks")
     @patch("agent_scan.guard.mint_push_key", return_value="minted-pk")
