@@ -265,7 +265,7 @@ async def analyze_machine(
                     analysis_url,
                     data=payload.model_dump_json(),
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=30),
+                    timeout=aiohttp.ClientTimeout(total=75),
                 ) as response:
                     response.raise_for_status()
                     if response.status == 200:
