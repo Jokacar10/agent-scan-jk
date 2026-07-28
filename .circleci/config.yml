@@ -106,6 +106,7 @@ workflows:
           name: Scan repository for secrets
           context:
             - snyk-bot-slack
+            - prodsec-orb-runtime
           channel: mcp-scan-alerting
           trusted-branch: main
 
@@ -114,6 +115,7 @@ workflows:
           context:
             - << pipeline.parameters.snyk-scan-context >>
             - snyk-bot-slack
+            - prodsec-orb-runtime
 
 
   daily-security-scan:
@@ -125,3 +127,4 @@ workflows:
           context:
             - << pipeline.parameters.snyk-scan-context >>
             - snyk-bot-slack
+            - prodsec-orb-runtime
