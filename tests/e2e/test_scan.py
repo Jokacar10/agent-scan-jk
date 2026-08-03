@@ -93,7 +93,7 @@ class TestFullScanFlow:
                 "--dangerously-run-mcp-servers",
                 path,
                 "--analysis-url",
-                "https://api.snyk.io/hidden/mcp-scan/analysis-machine?version=2025-09-07",
+                "https://api.snyk.io/hidden/mcp-scan/analysis-machine?version=2025-09-02",
             ],
             capture_output=True,
             text=True,
@@ -126,7 +126,7 @@ class TestFullScanFlow:
     def test_ci_exit_code_with_flag(self, agent_scan_cmd):
         """Math config + analysis yields W001; --ci exits 1."""
         math_config = "tests/mcp_servers/configs_files/math_config.json"
-        analysis_url = "https://api.snyk.io/hidden/mcp-scan/analysis-machine?version=2025-09-07"
+        analysis_url = "https://api.snyk.io/hidden/mcp-scan/analysis-machine?version=2025-09-02"
         base_cmd = [
             *agent_scan_cmd,
             "scan",
