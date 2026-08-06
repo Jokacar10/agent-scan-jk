@@ -94,6 +94,7 @@ jobs:
       - prodsec/security_scans:
           mode: << parameters.mode >>
           open-source-additional-arguments: --exclude=mcp-builder,slack-gif-creator
+          open-source-agentic-fix-enabled: true
           open-source-scan: medium
           iac-scan: disabled
       - notify_slack_on_failure
