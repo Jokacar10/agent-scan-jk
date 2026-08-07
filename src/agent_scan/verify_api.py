@@ -1,5 +1,6 @@
 import asyncio
 import getpass
+import gzip
 import logging
 import os
 import ssl
@@ -24,6 +25,75 @@ logger = logging.getLogger(__name__)
 
 class SnykTokenError(Exception):
     """Raised when SNYK_TOKEN is required but not set. Handled at top level to exit without traceback."""
+
+
+# Sync push-key endpoint suffix and its async counterpart.
+_SYNC_ANALYSIS_PATH = "/hidden/mcp-scan/analysis-machine"
+_ASYNC_ANALYSIS_PATH = "/hidden/agent-scan/async/analysis"
+_AGENT_SCAN_CONFIG_PATH = "/hidden/agent-scan/config"
+
+
+async def _async_analysis_enabled(
+    config_url: str,
+    push_key: str,
+    trace_configs: list | None,
+    skip_ssl_verify: bool,
+) -> bool:
+    """Ask the backend whether this push-key's tenant routes to async analysis.
+
+    Returns False on any error or non-200 response so the caller uses the
+    synchronous path.
+    """
+    try:
+        async with _analysis_client_session(trace_configs, skip_ssl_verify) as session:
+            async with session.get(
+                config_url,
+                headers={"X-Push-Key": push_key},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as response:
+                if response.status != 200:
+                    logger.warning(
+                        "Agent Scan config request returned %s; using synchronous analysis.", response.status
+                    )
+                    return False
+                data = await response.json()
+                return bool(data.get("async_analysis_enabled", False))
+    except (TimeoutError, aiohttp.ClientError) as e:
+        logger.warning("Agent Scan config request failed (%s); using synchronous analysis.", e)
+        return False
+
+
+async def _submit_async_analysis(
+    async_url: str,
+    payload: "ScanPathResultsCreate",
+    base_headers: dict[str, str],
+    identifier: str | None,
+    trace_configs: list | None,
+    skip_ssl_verify: bool,
+) -> None:
+    """Stream the gzipped payload to the async accept endpoint"""
+    body = gzip.compress(payload.model_dump_json().encode("utf-8"))
+    headers = {
+        **base_headers,
+        "Content-Type": "application/json",
+        "Content-Encoding": "gzip",
+    }
+    if identifier:
+        headers["X-Scan-User-Id"] = identifier
+    try:
+        async with _analysis_client_session(trace_configs, skip_ssl_verify) as session:
+            async with session.post(
+                async_url,
+                data=body,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=75),
+            ) as response:
+                if response.status == 202:
+                    logger.info("Scan accepted for asynchronous analysis.")
+                else:
+                    logger.warning("Async analysis returned status %s.", response.status)
+    except (TimeoutError, aiohttp.ClientError) as e:
+        logger.warning("Async analysis request failed: %s", e)
 
 
 def get_hostname() -> str:
@@ -165,6 +235,15 @@ def setup_tcp_connector(skip_ssl_verify: bool = False) -> aiohttp.TCPConnector:
     return connector
 
 
+def _analysis_client_session(trace_configs: list | None, skip_ssl_verify: bool) -> aiohttp.ClientSession:
+    """Build a ClientSession with the shared connector, tracing and proxy settings."""
+    return aiohttp.ClientSession(
+        trace_configs=trace_configs,
+        connector=setup_tcp_connector(skip_ssl_verify=skip_ssl_verify),
+        trust_env=True,
+    )
+
+
 async def analyze_machine(
     scan_paths: list[ScanPathResult],
     analysis_url: str,
@@ -235,6 +314,11 @@ async def analyze_machine(
         # Enterprise MDM mode with push key
         # The analysis_url in this case has authentication through push_key (not on api-gateway)
         headers["X-Push-Key"] = push_key
+        config_url = analysis_url.replace(_SYNC_ANALYSIS_PATH, _AGENT_SCAN_CONFIG_PATH)
+        if await _async_analysis_enabled(config_url, push_key, trace_configs, skip_ssl_verify):
+            async_url = analysis_url.replace(_SYNC_ANALYSIS_PATH, _ASYNC_ANALYSIS_PATH)
+            await _submit_async_analysis(async_url, payload, headers, identifier, trace_configs, skip_ssl_verify)
+            return scan_paths
     elif snyk_token:
         # CLI mode with SNYK_TOKEN environment variable for authentication
         analysis_url = analysis_url.replace(
@@ -256,11 +340,7 @@ async def analyze_machine(
 
     for attempt in range(max_retries):
         try:
-            async with aiohttp.ClientSession(
-                trace_configs=trace_configs,
-                connector=setup_tcp_connector(skip_ssl_verify=skip_ssl_verify),
-                trust_env=True,
-            ) as session:
+            async with _analysis_client_session(trace_configs, skip_ssl_verify) as session:
                 async with session.post(
                     analysis_url,
                     data=payload.model_dump_json(),
