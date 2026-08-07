@@ -90,3 +90,4 @@
 - `0.5.14` Fix --insecure usage with the Snyk CLI. Remove unused API calls.
 - `0.5.15` Fix false error triggering on skipping guard installations on missing agents.
 - `0.5.16` Security fixes. Increase analysis request timeout. Add CLI reference docs and refresh JSON output docs.
+- `0.5.17` Introduce support for async analysis. Security fixes related to dependencies.
