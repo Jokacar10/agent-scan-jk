@@ -1,5 +1,6 @@
 """Unit tests for the verify_api module, including HTTP proxy support."""
 
+import gzip
 import json
 import os
 import ssl
@@ -17,7 +18,13 @@ from agent_scan.models import (
     ServerSignature,
     StdioServer,
 )
-from agent_scan.verify_api import analyze_machine, load_extra_ca_certs, setup_tcp_connector
+from agent_scan.verify_api import (
+    _async_analysis_enabled,
+    _submit_async_analysis,
+    analyze_machine,
+    load_extra_ca_certs,
+    setup_tcp_connector,
+)
 
 
 class TestProxySupport:
@@ -837,3 +844,245 @@ class TestAnalyzeMachineHttpErrors:
         figma, playwright = claude.servers
         assert figma.error is not None and figma.error.category == "server_startup"
         assert playwright.error is not None and playwright.error.category == "analysis_error"
+
+
+def _make_get_session(*, status, json_data=None, get_exc=None):
+    """A mock ClientSession whose ``.get(...)`` yields a response with the given status/json."""
+    mock_session = MagicMock()
+    mock_response = AsyncMock()
+    mock_response.status = status
+    mock_response.json = AsyncMock(return_value=json_data)
+
+    mock_get = MagicMock()
+    if get_exc is not None:
+        mock_get.__aenter__ = AsyncMock(side_effect=get_exc)
+    else:
+        mock_get.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_get.__aexit__ = AsyncMock(return_value=None)
+
+    mock_session.get = MagicMock(return_value=mock_get)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    return mock_session
+
+
+def _make_post_session(*, status=202, post_exc=None):
+    """A mock ClientSession whose ``.post(...)`` yields a response with the given status."""
+    mock_session = MagicMock()
+    mock_response = AsyncMock()
+    mock_response.status = status
+
+    mock_post = MagicMock()
+    if post_exc is not None:
+        mock_post.__aenter__ = AsyncMock(side_effect=post_exc)
+    else:
+        mock_post.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_post.__aexit__ = AsyncMock(return_value=None)
+
+    mock_session.post = MagicMock(return_value=mock_post)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    return mock_session
+
+
+def _make_sync_ok_session():
+    """A mock ClientSession for the synchronous analysis POST returning a 200 with empty results."""
+    mock_session = MagicMock()
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.text = AsyncMock(
+        return_value='{"scan_path_results": [{"path": "/test/path", "issues": [], "labels": []}], "scan_user_info": {}}'
+    )
+    mock_response.raise_for_status = MagicMock()
+
+    mock_post = MagicMock()
+    mock_post.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_post.__aexit__ = AsyncMock(return_value=None)
+
+    mock_session.post = MagicMock(return_value=mock_post)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    return mock_session
+
+
+class TestAsyncAnalysisEnabled:
+    """The push-key config lookup that decides sync vs async analysis per tenant."""
+
+    _CONFIG_URL = "https://api.snyk.io/hidden/agent-scan/config?version=2025-09-02"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "json_data, expected",
+        [
+            ({"async_analysis_enabled": True}, True),
+            ({"async_analysis_enabled": False}, False),
+            ({}, False),
+        ],
+        ids=["enabled", "disabled", "missing_key"],
+    )
+    async def test_parses_flag_from_config_response(self, json_data, expected):
+        with patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls:
+            mock_cls.return_value = _make_get_session(status=200, json_data=json_data)
+            result = await _async_analysis_enabled(self._CONFIG_URL, "push-abc", None, False)
+        assert result is expected
+
+    @pytest.mark.asyncio
+    async def test_sends_push_key_header_to_config_url(self):
+        with patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls:
+            session = _make_get_session(status=200, json_data={"async_analysis_enabled": True})
+            mock_cls.return_value = session
+            await _async_analysis_enabled(self._CONFIG_URL, "push-abc", None, False)
+
+        session.get.assert_called_once()
+        assert session.get.call_args[0][0] == self._CONFIG_URL
+        assert session.get.call_args[1]["headers"]["X-Push-Key"] == "push-abc"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [401, 404, 500, 503])
+    async def test_non_200_returns_false(self, status):
+        with patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls:
+            mock_cls.return_value = _make_get_session(status=status, json_data={"async_analysis_enabled": True})
+            result = await _async_analysis_enabled(self._CONFIG_URL, "push-abc", None, False)
+        assert result is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "exc",
+        [aiohttp.ClientError("boom"), TimeoutError("slow")],
+        ids=["client_error", "timeout"],
+    )
+    async def test_network_error_returns_false(self, exc):
+        with patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls:
+            mock_cls.return_value = _make_get_session(status=200, get_exc=exc)
+            result = await _async_analysis_enabled(self._CONFIG_URL, "push-abc", None, False)
+        assert result is False
+
+
+class TestSubmitAsyncAnalysis:
+    """The fire-and-forget async submission: gzipped body, headers, and no-raise on failure."""
+
+    _ASYNC_URL = "https://api.snyk.io/hidden/agent-scan/async/analysis?version=2025-09-02"
+
+    @pytest.mark.asyncio
+    async def test_gzips_payload_and_sets_headers(self):
+        payload = MagicMock()
+        payload.model_dump_json.return_value = '{"scan_path_results": []}'
+
+        with patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls:
+            session = _make_post_session(status=202)
+            mock_cls.return_value = session
+            await _submit_async_analysis(
+                self._ASYNC_URL,
+                payload,
+                {"X-Push-Key": "pk", "X-Environment": "test"},
+                "user-1",
+                None,
+                False,
+            )
+
+        session.post.assert_called_once()
+        call = session.post.call_args
+        assert call[0][0] == self._ASYNC_URL
+        headers = call[1]["headers"]
+        assert headers["Content-Encoding"] == "gzip"
+        assert headers["X-Push-Key"] == "pk"
+        assert headers["X-Scan-User-Id"] == "user-1"
+        assert gzip.decompress(call[1]["data"]) == b'{"scan_path_results": []}'
+
+    @pytest.mark.asyncio
+    async def test_omits_scan_user_id_without_identifier(self):
+        payload = MagicMock()
+        payload.model_dump_json.return_value = "{}"
+
+        with patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls:
+            session = _make_post_session(status=202)
+            mock_cls.return_value = session
+            await _submit_async_analysis(self._ASYNC_URL, payload, {"X-Push-Key": "pk"}, None, None, False)
+
+        assert "X-Scan-User-Id" not in session.post.call_args[1]["headers"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [400, 500, 503])
+    async def test_non_202_does_not_raise(self, status):
+        payload = MagicMock()
+        payload.model_dump_json.return_value = "{}"
+
+        with patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls:
+            mock_cls.return_value = _make_post_session(status=status)
+            # Must return without raising (fire-and-forget).
+            assert await _submit_async_analysis(self._ASYNC_URL, payload, {}, None, None, False) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "exc",
+        [aiohttp.ClientError("boom"), TimeoutError("slow")],
+        ids=["client_error", "timeout"],
+    )
+    async def test_network_error_does_not_raise(self, exc):
+        payload = MagicMock()
+        payload.model_dump_json.return_value = "{}"
+
+        with patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls:
+            mock_cls.return_value = _make_post_session(post_exc=exc)
+            assert await _submit_async_analysis(self._ASYNC_URL, payload, {}, None, None, False) is None
+
+
+class TestAnalyzeMachineAsyncRouting:
+    """analyze_machine's push-key routing: async when the tenant is flagged, sync otherwise, no fallback."""
+
+    _ANALYSIS_URL = "https://api.snyk.io/hidden/mcp-scan/analysis-machine?version=2025-09-02"
+
+    @pytest.mark.asyncio
+    async def test_async_enabled_submits_async_and_skips_sync(self):
+        scan_paths = [ScanPathResult(path="/test/path")]
+
+        with (
+            patch(
+                "agent_scan.verify_api._async_analysis_enabled", new_callable=AsyncMock, return_value=True
+            ) as mock_enabled,
+            patch("agent_scan.verify_api._submit_async_analysis", new_callable=AsyncMock) as mock_submit,
+            patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_session_class,
+        ):
+            result = await analyze_machine(
+                scan_paths=scan_paths,
+                analysis_url=self._ANALYSIS_URL,
+                identifier="id-1",
+                push_key="push-abc",
+            )
+
+        mock_enabled.assert_awaited_once()
+        mock_submit.assert_awaited_once()
+        # No synchronous analysis session is ever opened once async is chosen.
+        mock_session_class.assert_not_called()
+        assert result is scan_paths
+        # Config + async URLs are derived from the sync analysis URL, preserving the version query.
+        assert mock_enabled.call_args[0][0] == "https://api.snyk.io/hidden/agent-scan/config?version=2025-09-02"
+        assert mock_submit.call_args[0][0] == "https://api.snyk.io/hidden/agent-scan/async/analysis?version=2025-09-02"
+
+    @pytest.mark.asyncio
+    async def test_async_disabled_falls_through_to_sync(self):
+        scan_paths = [ScanPathResult(path="/test/path")]
+
+        with (
+            patch(
+                "agent_scan.verify_api._async_analysis_enabled", new_callable=AsyncMock, return_value=False
+            ) as mock_enabled,
+            patch("agent_scan.verify_api._submit_async_analysis", new_callable=AsyncMock) as mock_submit,
+            patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_session_class,
+        ):
+            mock_session_class.return_value = _make_sync_ok_session()
+            result = await analyze_machine(
+                scan_paths=scan_paths,
+                analysis_url=self._ANALYSIS_URL,
+                identifier=None,
+                push_key="push-abc",
+            )
+
+        mock_enabled.assert_awaited_once()
+        mock_submit.assert_not_awaited()
+        mock_session_class.assert_called_once()
+        # The sync request keeps the push-key auth and the un-rewritten analysis URL.
+        call = mock_session_class.return_value.post.call_args
+        assert call[0][0] == self._ANALYSIS_URL
+        assert call[1]["headers"]["X-Push-Key"] == "push-abc"
+        assert len(result) == 1
