@@ -45,11 +45,7 @@ async def _async_analysis_enabled(
     synchronous path.
     """
     try:
-        async with aiohttp.ClientSession(
-            trace_configs=trace_configs,
-            connector=setup_tcp_connector(skip_ssl_verify=skip_ssl_verify),
-            trust_env=True,
-        ) as session:
+        async with _analysis_client_session(trace_configs, skip_ssl_verify) as session:
             async with session.get(
                 config_url,
                 headers={"X-Push-Key": push_key},
@@ -85,11 +81,7 @@ async def _submit_async_analysis(
     if identifier:
         headers["X-Scan-User-Id"] = identifier
     try:
-        async with aiohttp.ClientSession(
-            trace_configs=trace_configs,
-            connector=setup_tcp_connector(skip_ssl_verify=skip_ssl_verify),
-            trust_env=True,
-        ) as session:
+        async with _analysis_client_session(trace_configs, skip_ssl_verify) as session:
             async with session.post(
                 async_url,
                 data=body,
@@ -243,6 +235,15 @@ def setup_tcp_connector(skip_ssl_verify: bool = False) -> aiohttp.TCPConnector:
     return connector
 
 
+def _analysis_client_session(trace_configs: list | None, skip_ssl_verify: bool) -> aiohttp.ClientSession:
+    """Build a ClientSession with the shared connector, tracing and proxy settings."""
+    return aiohttp.ClientSession(
+        trace_configs=trace_configs,
+        connector=setup_tcp_connector(skip_ssl_verify=skip_ssl_verify),
+        trust_env=True,
+    )
+
+
 async def analyze_machine(
     scan_paths: list[ScanPathResult],
     analysis_url: str,
@@ -339,11 +340,7 @@ async def analyze_machine(
 
     for attempt in range(max_retries):
         try:
-            async with aiohttp.ClientSession(
-                trace_configs=trace_configs,
-                connector=setup_tcp_connector(skip_ssl_verify=skip_ssl_verify),
-                trust_env=True,
-            ) as session:
+            async with _analysis_client_session(trace_configs, skip_ssl_verify) as session:
                 async with session.post(
                     analysis_url,
                     data=payload.model_dump_json(),
