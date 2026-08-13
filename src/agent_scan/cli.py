@@ -11,11 +11,13 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from dataclasses import dataclass
 
 import psutil
 import rich
+import yaml
 from rich.logging import RichHandler
 
 from agent_scan.consent import collect_consent
@@ -152,6 +154,161 @@ def parse_control_servers(argv) -> list[ControlServer]:
     return control_servers
 
 
+# Option strings that make up a single control-server block. Passing any of
+# them on the CLI triggers complete replacement of the config-file's
+# ``control_servers`` list (see apply_config_file).
+_CONTROL_SERVER_DESTS = ("control_server", "control_server_H", "control_identifier")
+
+
+def _iter_all_actions(parser: argparse.ArgumentParser):
+    """Yield every argparse action reachable from ``parser``, descending into subparsers."""
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for subparser in action.choices.values():
+                yield from _iter_all_actions(subparser)
+        else:
+            yield action
+
+
+def explicitly_provided_dests(parser: argparse.ArgumentParser, argv: list[str]) -> set[str]:
+    """
+    Return the set of argument ``dest`` names the user passed explicitly on the
+    command line.
+
+    We inspect the raw ``argv`` rather than the parsed namespace because argparse
+    cannot distinguish "flag omitted" (dest holds its default) from "flag passed
+    with a value equal to its default". Both ``--flag value`` and ``--flag=value``
+    spellings are recognized, as are the two option strings of a
+    BooleanOptionalAction (``--skills`` / ``--no-skills`` both map to ``skills``).
+    """
+    option_to_dest: dict[str, str] = {}
+    for action in _iter_all_actions(parser):
+        for option in action.option_strings:
+            option_to_dest[option] = action.dest
+
+    provided: set[str] = set()
+    for token in argv:
+        option = token.split("=", 1)[0]
+        dest = option_to_dest.get(option)
+        if dest is not None:
+            provided.add(dest)
+    return provided
+
+
+def _fail_config(message: str) -> None:
+    """Print a config-file error to stderr and exit with the CLI's usage code."""
+    rich.print(f"[bold red]{message}[/bold red]", file=sys.stderr)
+    sys.exit(2)
+
+
+def load_config_file(path: str) -> dict:
+    """Read a YAML config file into a mapping. Exits with code 2 on any error."""
+    expanded = os.path.expanduser(path)
+    try:
+        with open(expanded) as f:
+            data = yaml.safe_load(f)
+    except FileNotFoundError:
+        _fail_config(f"Config file not found: {path}")
+    except OSError as e:
+        _fail_config(f"Could not read config file {path}: {e}")
+    except yaml.YAMLError as e:
+        _fail_config(f"Invalid YAML in config file {path}: {e}")
+
+    if data is None:  # empty file
+        return {}
+    if not isinstance(data, dict):
+        _fail_config(f"Config file {path} must contain a YAML mapping at the top level.")
+    return data
+
+
+def control_servers_from_config(raw) -> list[ControlServer]:
+    """
+    Build ControlServer instances from the config file's ``control_servers`` block.
+
+    Each entry is a mapping with ``url``, ``identifier``, and optional ``headers``.
+    Headers may be given as a mapping (``{name: value}``) or as a list of
+    ``"Name: value"`` strings (matching the ``--control-server-H`` CLI form).
+    """
+    if not isinstance(raw, list):
+        _fail_config("'control_servers' in the config file must be a list.")
+
+    control_servers: list[ControlServer] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            _fail_config("Each entry under 'control_servers' must be a mapping.")
+        url = entry.get("url")
+        identifier = entry.get("identifier")
+        headers = entry.get("headers") or {}
+        if isinstance(headers, list):
+            headers = parse_headers(headers)
+
+        if not url:
+            _fail_config("A control server in the config file is missing a 'url'.")
+        if identifier is None:
+            rich.print(
+                f"[bold red]Control server {url} in the config file is missing an 'identifier'.[/bold red]",
+                file=sys.stderr,
+            )
+            raise MissingIdentifierError(f"Control server {url} is missing an identifier")
+
+        control_servers.append(ControlServer(url=url, headers=headers, identifier=identifier))
+
+    return control_servers
+
+
+def apply_config_file(parser: argparse.ArgumentParser, args: argparse.Namespace, argv: list[str]) -> None:
+    """
+    Merge values from ``args.config_file`` into ``args``.
+
+    Precedence cascade: code defaults < YAML config file < explicit CLI flags.
+    Scalar options are overridden field-by-field. Block/list options
+    (``control_servers``, append lists, and the positional ``files``) use
+    *complete replacement*: if the user supplied the corresponding flag on the
+    command line, the whole YAML value for that key is discarded rather than
+    merged element-wise.
+
+    No-op when ``--config-file`` was not supplied, preserving current behavior.
+    """
+    config_path = getattr(args, "config_file", None)
+    if not config_path:
+        return
+
+    config = load_config_file(config_path)
+    explicit = explicitly_provided_dests(parser, argv)
+
+    # The positional ``files`` list has no option string, so treat any positional
+    # value present on the CLI as an explicit override of the YAML ``files``.
+    if getattr(args, "files", None):
+        explicit.add("files")
+
+    valid_dests = {a.dest for a in _iter_all_actions(parser) if a.dest not in (argparse.SUPPRESS, "help")}
+
+    # control_servers is assembled outside argparse (see parse_control_servers),
+    # so it is handled here with complete-replacement semantics.
+    if "control_servers" in config and not any(dest in explicit for dest in _CONTROL_SERVER_DESTS):
+        args.control_servers = control_servers_from_config(config["control_servers"])
+
+    # For every remaining key the rule is uniform: an explicit CLI flag wins,
+    # otherwise the config value is applied. This yields field-level override for
+    # scalars and *complete replacement* for repeatable/list args (e.g. the
+    # ``append`` flag ``--verification-H``): argparse hands us the whole CLI list
+    # as one value, so we take either the entire CLI list or the entire YAML
+    # list, never a per-element merge — the same semantics used for
+    # ``control_servers`` above.
+    for raw_key, value in config.items():
+        key = raw_key.replace("-", "_")
+        if key in ("control_servers", "config_file"):
+            continue  # handled above / self-reference
+        if key in _CONTROL_SERVER_DESTS:
+            continue  # control servers come from the 'control_servers' block only
+        if key not in valid_dests:
+            rich.print(f"[yellow]Ignoring unknown key '{raw_key}' in config file.[/yellow]", file=sys.stderr)
+            continue
+        if key in explicit:
+            continue  # explicit CLI flag wins over the config file (whole value)
+        setattr(args, key, value)
+
+
 def add_common_arguments(parser):
     """Add arguments that are common to multiple commands."""
     parser.add_argument(
@@ -232,6 +389,17 @@ def add_common_arguments(parser):
         type=str,
         default=None,
         help="Comma-separated list of issue codes to ignore (e.g. W001,W015)",
+    )
+    parser.add_argument(
+        "--config-file",
+        type=str,
+        default=None,
+        help=(
+            "Load CLI arguments from a YAML config file. Precedence is "
+            "code defaults < config file < explicit CLI flags: any flag you also "
+            "pass on the command line overrides the file."
+        ),
+        metavar="FILE",
     )
 
 
@@ -438,6 +606,13 @@ def main():
     program_name = get_invoking_name()
     parser = argparse.ArgumentParser(
         prog=program_name,
+        # Disable prefix abbreviation (argparse defaults it on). Abbreviations
+        # are undocumented, and the config-file merge detects explicitly-passed
+        # flags by matching full option strings in argv (see
+        # explicitly_provided_dests) — an abbreviation like ``--verb`` would slip
+        # past that check. allow_abbrev is per-parser and does not inherit, so it
+        # is set again on each subparser below.
+        allow_abbrev=False,
         description="Snyk Agent Scan: Security scanner for Model Context Protocol servers, agents, skills and tools",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -468,6 +643,7 @@ def main():
     # SCAN command
     scan_parser = subparsers.add_parser(
         "scan",
+        allow_abbrev=False,
         help="Scan one or more MCP config files [default]",
         description=(
             "Scan one or more MCP configuration files for security issues. "
@@ -479,6 +655,7 @@ def main():
     # INSPECT command
     inspect_parser = subparsers.add_parser(
         "inspect",
+        allow_abbrev=False,
         help="Print descriptions of tools, prompts, and resources without verification",
         description="Inspect and display MCP tools, prompts, and resources without security verification.",
     )
@@ -502,7 +679,7 @@ def main():
     )
 
     # EVO command
-    evo_parser = subparsers.add_parser("evo", help="Push scan results to Snyk Evo")
+    evo_parser = subparsers.add_parser("evo", allow_abbrev=False, help="Push scan results to Snyk Evo")
 
     # use the same parser as scan
     setup_scan_parser(evo_parser)
@@ -510,6 +687,7 @@ def main():
     # GUARD command
     guard_parser = subparsers.add_parser(
         "guard",
+        allow_abbrev=False,
         help="Install, uninstall, or check status of Agent Guard hooks",
         description="Manage Agent Guard hooks for Claude Code, Cursor, and Codex.",
     )
@@ -522,6 +700,7 @@ def main():
 
     guard_install_parser = guard_subparsers.add_parser(
         "install",
+        allow_abbrev=False,
         help="Install Agent Guard hooks for a client",
     )
     guard_install_parser.add_argument(
@@ -563,6 +742,7 @@ def main():
 
     guard_uninstall_parser = guard_subparsers.add_parser(
         "uninstall",
+        allow_abbrev=False,
         help="Remove Agent Guard hooks for a client",
     )
     guard_uninstall_parser.add_argument(
@@ -596,6 +776,10 @@ def main():
 
     # Attach parsed control servers to args
     args.control_servers = control_servers
+
+    # Merge a --config-file (if any) before resolving defaults, so its values
+    # sit between code defaults and explicit CLI flags in the precedence cascade.
+    apply_config_file(parser, args, sys.argv[1:])
 
     # Resolve deferred defaults and enforce safety rules before dispatching.
     resolve_server_io_default(args)

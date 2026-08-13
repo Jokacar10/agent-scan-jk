@@ -125,6 +125,54 @@ Bootstrap behavior is described in the [README — Control Server Bootstrap](../
 | `1` | `--ci`: findings or unignored runtime failures present |
 | `2` | Invalid flag combination |
 
+### Configuration file
+
+Load any of the flags above from a YAML file instead of passing them all on the command line. Applies to `scan`, `inspect`, and `evo` (not `guard`).
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--config-file FILE` | string | — | Path to a YAML file supplying argument values. Errors (missing file, invalid YAML, non-mapping top level) exit with code **2**. |
+
+**Precedence.** Values resolve as `code defaults < config file < explicit CLI flags`. A flag you also pass on the command line always wins over the file; a flag you omit takes the file's value, or the built-in default if the file doesn't set it.
+
+**Keys.** Every global/scan flag is settable. Use the flag's long name with dashes or underscores — `server-timeout` and `server_timeout` are equivalent. Values are native YAML types (`true`/`false`, numbers, strings, lists), so `--suppress-mcpserver-io` becomes `suppress_mcpserver_io: true`. Unknown keys are ignored with a warning on stderr.
+
+**Scalars vs. blocks/lists.** Scalar options (`server_timeout`, `analysis_url`, booleans, …) override field-by-field. Block/list options — the positional `files`, repeatable headers like `verification_H`, and the `control_servers` block — use **complete replacement**: if you pass *any* CLI flag for that structure, the file's entire array for it is discarded (no element-wise merge) and rebuilt from the CLI alone.
+
+**Control servers.** The `--control-server` / `--control-server-H` / `--control-identifier` block is expressed as a `control_servers` list; `headers` may be a mapping or a list of `Name: value` strings. Passing any one of those three flags on the CLI replaces the whole `control_servers` list from the file.
+
+```yaml
+# agent-scan.yaml
+json: true
+skills: true              # set false to skip skills (equivalent to --no-skills)
+server_timeout: 30
+scan_all_users: true
+verification_H:
+  - "X-Trace: abc123"
+files:
+  - ~/.cursor/mcp.json
+  - ~/.claude/skills
+control_servers:
+  - url: https://api.snyk.io/hidden/mcp-scan/push?version=2025-08-28
+    identifier: user@example.com
+    headers:
+      x-client-id: <push-key>
+```
+
+```bash
+# Use the file as-is
+snyk-agent-scan scan --config-file agent-scan.yaml
+
+# ...but override one scalar for this run (CLI wins)
+snyk-agent-scan scan --config-file agent-scan.yaml --server-timeout 5
+
+# Passing --control-server discards the file's control_servers list entirely
+snyk-agent-scan scan --config-file agent-scan.yaml \
+  --control-server https://other.example/push --control-identifier host-1
+```
+
+> Note: `skills` is on by default. In YAML, set `skills: false` to disable skill scanning (equivalent to `--no-skills`); there is no separate `no_skills` toggle at runtime — the `skills` key is the single source of truth.
+
 ---
 
 ## MCP server options
@@ -334,6 +382,10 @@ uvx snyk-agent-scan@latest --ci --dangerously-run-mcp-servers \
 
 # All users on a shared machine
 uvx snyk-agent-scan@latest --scan-all-users
+
+# Load flags from a YAML config file (CLI flags still override it)
+uvx snyk-agent-scan@latest --config-file agent-scan.yaml
+uvx snyk-agent-scan@latest --config-file agent-scan.yaml --server-timeout 5
 
 # Enterprise upload with push key
 export SNYK_TOKEN=...   # not required when push key is in control-server headers
