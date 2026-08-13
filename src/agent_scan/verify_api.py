@@ -366,7 +366,7 @@ async def analyze_machine(
     raise_on_error: bool = False,
     scan_context: dict | None = None,
     scanned_usernames: list[str] | None = None,
-    show_results: bool = False,
+    show_analysis_results: bool = False,
 ) -> ScanResponse:
     """
     Analyze the scan paths with the analysis server.
@@ -381,7 +381,7 @@ async def analyze_machine(
         max_retries: Maximum number of retry attempts
         skip_ssl_verify: Whether to skip SSL verification
         scan_context: Optional dict containing scan metadata to include in the request
-        show_results: Force synchronous analysis so results are returned instead of
+        show_analysis_results: Force synchronous analysis so results are returned instead of
             submitting asynchronously (push-key tenants default to async)
     """
     analysis_url = _force_analysis_api_version(analysis_url)
@@ -418,7 +418,7 @@ async def analyze_machine(
         # Enterprise MDM mode with push key
         # The analysis_url in this case has authentication through push_key (not on api-gateway)
         headers["X-Push-Key"] = push_key
-        if not show_results:
+        if not show_analysis_results:
             config_url = analysis_url.replace(_SYNC_ANALYSIS_PATH, _AGENT_SCAN_CONFIG_PATH)
             if await _async_analysis_enabled(config_url, push_key, trace_configs, skip_ssl_verify):
                 async_url = analysis_url.replace(_SYNC_ANALYSIS_PATH, _ASYNC_ANALYSIS_PATH)

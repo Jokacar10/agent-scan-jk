@@ -227,7 +227,7 @@ def add_common_arguments(parser):
         help="Scan all users on the machine.",
     )
     parser.add_argument(
-        "--show-results",
+        "--show-analysis-results",
         action="store_true",
         default=False,
         help="Show the scan results. Overrides the default behavior when using push keys.",
@@ -711,9 +711,13 @@ async def evo(args):
         rich.print(f"[bold red]Error revoking client_id[/bold red]: {e}")
 
 
-def _should_show_results(args) -> bool:
-    """Show results (force synchronous analysis) for evo, CI, or --show-results."""
-    return getattr(args, "command", None) == "evo" or getattr(args, "ci", False) or getattr(args, "show_results", False)
+def _should_show_analysis_results(args) -> bool:
+    """Show analysis results (force synchronous analysis) for evo, CI, or --show-analysis-results."""
+    return (
+        getattr(args, "command", None) == "evo"
+        or getattr(args, "ci", False)
+        or getattr(args, "show_analysis_results", False)
+    )
 
 
 async def run_scan(args, mode: Literal["scan", "inspect"] = "scan") -> ScanResponse | list[InspectedPath]:
@@ -786,7 +790,7 @@ async def run_scan(args, mode: Literal["scan", "inspect"] = "scan") -> ScanRespo
             additional_headers=parse_headers(args.verification_H),
             max_retries=3,
             skip_ssl_verify=skip_ssl_verify,
-            show_results=_should_show_results(args),
+            show_analysis_results=_should_show_analysis_results(args),
         )
         push_args = PushArgs(
             control_servers=control_servers,

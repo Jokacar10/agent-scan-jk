@@ -72,7 +72,7 @@ snyk-agent-scan evo [CONFIG_FILE ...]
 | `--verbose` | boolean | `false` | Enable debug logging to stderr. |
 | `--print-errors` | boolean | `false` | Show error details and tracebacks in the human-readable report. |
 | `--print-full-descriptions` | boolean | `false` | Show full tool and skill descriptions rather than truncating them. |
-| `--show-results` | boolean | `false` | Force synchronous analysis so scan results are returned and displayed. Overrides the default push-key behavior, which submits the scan asynchronously and returns no local results. Implied by `--ci` and the `evo` command. See [Push keys and results](#push-keys-and-results). |
+| `--show-analysis-results` | boolean | `false` | Force synchronous analysis so scan results are returned and displayed. Overrides the default push-key behavior, which submits the scan asynchronously and returns no local results. Implied by `--ci` and the `evo` command. See [Push keys and results](#push-keys-and-results). |
 
 ### Discovery and scope
 
@@ -151,7 +151,7 @@ Use `--dangerously-run-mcp-servers` only when a trusted fleet or CI job must exe
 
 When a scan authenticates with a push key and the tenant has asynchronous analysis enabled, Agent Scan submits the scan to the async endpoint and returns immediately without local results—results are processed and reported on the Snyk side. This keeps unattended and fleet scans fast and fire-and-forget.
 
-Pass `--show-results` to force synchronous analysis instead, so the scan waits for the response and displays results locally (and in `--json` output). The synchronous path is also selected automatically for `--ci` runs and the `evo` command, so `--show-results` is only needed for a plain push-key `scan`.
+Pass `--show-analysis-results` to force synchronous analysis instead, so the scan waits for the response and displays results locally (and in `--json` output). The synchronous path is also selected automatically for `--ci` runs and the `evo` command, so `--show-analysis-results` is only needed for a plain push-key `scan`.
 
 ## CI mode
 

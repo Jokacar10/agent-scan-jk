@@ -1141,9 +1141,9 @@ class TestAnalyzeMachineAsyncRouting:
         assert result == ScanResponse(scan_path_responses=[ScanPathResponse(path="/test/path")])
 
     @pytest.mark.asyncio
-    async def test_show_results_skips_async_check_even_with_push_key(self):
-        """show_results=True must go straight to sync without ever probing the async-enabled config
-        endpoint, even for a push-key tenant that would otherwise route to async."""
+    async def test_show_analysis_results_skips_async_check_even_with_push_key(self):
+        """show_analysis_results=True must go straight to sync without ever probing the async-enabled
+        config endpoint, even for a push-key tenant that would otherwise route to async."""
         inspected_paths = [InspectedPath(path="/test/path")]
 
         with (
@@ -1159,7 +1159,7 @@ class TestAnalyzeMachineAsyncRouting:
                 analysis_url=self._ANALYSIS_URL,
                 identifier=None,
                 push_key="push-abc",
-                show_results=True,
+                show_analysis_results=True,
             )
 
         # The async gate is never consulted and no async submission happens.
