@@ -311,6 +311,7 @@ These options exist in both v0.5.x and v0.6 and later. Their command applicabili
 --skip-ssl-verify                 Disable TLS certificate verification
 --skills / --no-skills            Include skills (default) or skip them
 --scan-all-users                  Scan all readable user home directories
+--show-analysis-results           Force synchronous analysis so results display for push-key scans
 --ci                              Exit non-zero when findings or operational failures remain
 --server-timeout SECONDS          MCP connection timeout (default: 10)
 --suppress-mcpserver-io BOOL      Suppress stdio MCP server stderr

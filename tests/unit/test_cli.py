@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from agent_scan.cli import _handle_ci_exit, print_scan_inspect, setup_scan_parser
+from agent_scan.cli import _handle_ci_exit, _should_show_analysis_results, print_scan_inspect, setup_scan_parser
 from agent_scan.models import InspectedPath, ScanError
 from agent_scan.models.api.v20260710 import (
     McpServerRiskIndexes,
@@ -81,6 +81,37 @@ def test_scan_parser_accepts_show_full_discovery():
 
     assert parser.parse_args([]).show_full_discovery is False
     assert parser.parse_args(["--show-full-discovery"]).show_full_discovery is True
+
+
+def test_scan_parser_accepts_show_analysis_results():
+    parser = argparse.ArgumentParser()
+    setup_scan_parser(parser)
+
+    assert parser.parse_args([]).show_analysis_results is False
+    assert parser.parse_args(["--show-analysis-results"]).show_analysis_results is True
+
+
+@pytest.mark.parametrize(
+    "command, ci, show_analysis_results, expected",
+    [
+        (None, False, False, False),
+        ("scan", False, False, False),
+        ("evo", False, False, True),
+        ("scan", True, False, True),
+        ("scan", False, True, True),
+        # evo wins even if the other triggers are off; any single trigger forces sync.
+        ("evo", True, True, True),
+    ],
+)
+def test_should_show_analysis_results(command, ci, show_analysis_results, expected):
+    args = Namespace(command=command, ci=ci, show_analysis_results=show_analysis_results)
+
+    assert _should_show_analysis_results(args) is expected
+
+
+def test_should_show_analysis_results_tolerates_missing_attributes():
+    """run_scan is shared by scan/inspect; the helper must not blow up when flags are absent."""
+    assert _should_show_analysis_results(Namespace()) is False
 
 
 @pytest.mark.asyncio
