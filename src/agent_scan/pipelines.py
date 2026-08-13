@@ -10,18 +10,18 @@ from agent_scan.direct_scanner import direct_scan_to_server_config, is_direct_sc
 from agent_scan.inspect import (
     get_mcp_config_per_client,
     inspect_client,
-    inspected_client_to_scan_path_result,
 )
 from agent_scan.models import (
     CandidateClient,
     ClientToInspect,
     ControlServer,
+    DiscoveredSkill,
+    InspectedPath,
     ScanError,
-    ScanPathResult,
-    SkillServer,
+    ScanResponse,
     TokenAndClientInfo,
 )
-from agent_scan.redact import redact_scan_result
+from agent_scan.redact import redact_inspected_path
 from agent_scan.utils import get_push_key, get_readable_home_directories
 from agent_scan.verify_api import analyze_machine
 from agent_scan.well_known_clients import get_well_known_clients
@@ -43,6 +43,7 @@ class AnalyzeArgs(BaseModel):
     additional_headers: dict | None = None
     max_retries: int = 3
     skip_ssl_verify: bool = False
+    show_analysis_results: bool = False
 
 
 class PushArgs(BaseModel):
@@ -53,7 +54,7 @@ class PushArgs(BaseModel):
 
 async def discover_clients_to_inspect(
     inspect_args: InspectArgs,
-) -> tuple[list[ClientToInspect], list[ScanPathResult], list[str]]:
+) -> tuple[list[ClientToInspect], list[InspectedPath], list[str]]:
     """
     Discover the clients/configs that would be inspected, without actually
     starting any MCP servers.
@@ -61,7 +62,7 @@ async def discover_clients_to_inspect(
     home_dirs_with_users = get_readable_home_directories(all_users=inspect_args.all_users)
     all_usernames: list[str] = [username for _path, username in home_dirs_with_users]
 
-    scan_path_results: list[ScanPathResult] = []
+    unresolved_paths: list[InspectedPath] = []
     clients_to_inspect: list[ClientToInspect] = []
     if inspect_args.paths:
         for path in inspect_args.paths:
@@ -69,13 +70,11 @@ async def discover_clients_to_inspect(
             if ctis:
                 clients_to_inspect.extend(ctis)
             else:
-                scan_path_results.append(
-                    ScanPathResult(
-                        path=path,
-                        client=path,
-                        servers=[],
-                        issues=[],
-                        labels=[],
+                normalized_path = path.replace("\\", "/")
+                unresolved_paths.append(
+                    InspectedPath(
+                        path=normalized_path,
+                        client=normalized_path,
                         error=ScanError(
                             message="File or folder not found", is_failure=False, category="file_not_found"
                         ),
@@ -130,40 +129,48 @@ async def discover_clients_to_inspect(
     else:
         scanned_usernames = [getpass.getuser()]
 
-    return clients_to_inspect, scan_path_results, scanned_usernames
+    return clients_to_inspect, unresolved_paths, scanned_usernames
 
 
 async def inspect_pipeline(
     inspect_args: InspectArgs,
     *,
     clients_to_inspect: list[ClientToInspect] | None = None,
-    precomputed_scan_path_results: list[ScanPathResult] | None = None,
+    unresolved_paths: list[InspectedPath] | None = None,
     scanned_usernames: list[str] | None = None,
     stream_stderr: bool = False,
     declined_servers: set[tuple[str, str]] | None = None,
     do_stdio_handshake: bool = False,
-) -> tuple[list[ScanPathResult], list[str]]:
-    """
-    Inspect each discovered client's MCP servers.
+) -> tuple[list[InspectedPath], list[str]]:
+    """Inspect each discovered client and return ``InspectedPath`` results.
+
+    This result is shared by both ``inspect`` and the v2026-07-10 ``scan``
+    path.
+    Unresolved explicit paths (e.g. file-not-found) already have their error
+    represented by an otherwise-empty ``InspectedPath`` and are included directly.
     """
     if clients_to_inspect is None:
-        clients_to_inspect, precomputed_scan_path_results, scanned_usernames = await discover_clients_to_inspect(
-            inspect_args
-        )
-    scan_path_results: list[ScanPathResult] = list(precomputed_scan_path_results or [])
-
+        clients_to_inspect, unresolved_paths, scanned_usernames = await discover_clients_to_inspect(inspect_args)
+    inspected_paths = list(unresolved_paths or [])
     for client_to_inspect in clients_to_inspect:
-        inspected_client = await inspect_client(
-            client_to_inspect,
-            inspect_args.timeout,
-            inspect_args.tokens,
-            inspect_args.scan_skills,
-            stream_stderr=stream_stderr,
-            declined_servers=declined_servers,
-            do_stdio_handshake=do_stdio_handshake,
+        inspected_paths.append(
+            await inspect_client(
+                client_to_inspect,
+                inspect_args.timeout,
+                inspect_args.tokens,
+                inspect_args.scan_skills,
+                stream_stderr=stream_stderr,
+                declined_servers=declined_servers,
+                do_stdio_handshake=do_stdio_handshake,
+            )
         )
-        scan_path_results.append(inspected_client_to_scan_path_result(inspected_client))
-    return scan_path_results, scanned_usernames or []
+    # redact: applied here so every caller of inspect_pipeline (both `mcp-scan
+    # scan` and `mcp-scan inspect`) gets sanitized results, since `inspect`
+    # prints/dumps them directly without going through the analyze/push
+    # pipeline's API-boundary sanitization.
+    inspected_paths = [redact_inspected_path(path) for path in inspected_paths]
+
+    return inspected_paths, scanned_usernames or []
 
 
 async def inspect_analyze_push_pipeline(
@@ -173,33 +180,30 @@ async def inspect_analyze_push_pipeline(
     verbose: bool = False,
     *,
     clients_to_inspect: list[ClientToInspect] | None = None,
-    precomputed_scan_path_results: list[ScanPathResult] | None = None,
+    unresolved_paths: list[InspectedPath] | None = None,
     scanned_usernames: list[str] | None = None,
     stream_stderr: bool = False,
     declined_servers: set[tuple[str, str]] | None = None,
     do_stdio_handshake: bool = False,
-) -> list[ScanPathResult]:
+) -> ScanResponse:
     """
     Pipeline the scan and analyze the machine.
     """
     # inspect
-    scan_path_results, scanned_usernames = await inspect_pipeline(
+    inspected_paths, scanned_usernames = await inspect_pipeline(
         inspect_args,
         clients_to_inspect=clients_to_inspect,
-        precomputed_scan_path_results=precomputed_scan_path_results,
+        unresolved_paths=unresolved_paths,
         scanned_usernames=scanned_usernames,
         stream_stderr=stream_stderr,
         declined_servers=declined_servers,
         do_stdio_handshake=do_stdio_handshake,
     )
 
-    # redact
-    redacted_scan_path_results = [redact_scan_result(rv) for rv in scan_path_results]
-
     scan_context = {"cli_version": push_args.version}
     # analyze
-    verified_scan_path_results = await analyze_machine(
-        redacted_scan_path_results,
+    response = await analyze_machine(
+        inspected_paths,
         analysis_url=analyze_args.analysis_url,
         identifier=analyze_args.identifier,
         additional_headers=analyze_args.additional_headers,
@@ -210,9 +214,10 @@ async def inspect_analyze_push_pipeline(
         skip_ssl_verify=analyze_args.skip_ssl_verify,
         scan_context=scan_context,
         scanned_usernames=scanned_usernames,
+        show_analysis_results=analyze_args.show_analysis_results,
     )
 
-    return verified_scan_path_results
+    return response
 
 
 async def client_to_inspect_from_path(
@@ -247,7 +252,7 @@ async def client_to_inspect_from_path(
                     client_path=path_without_last_dir,
                     mcp_configs={},
                     skills_dirs={
-                        path_without_last_dir: [(last_dir, SkillServer(path=path))],
+                        path_without_last_dir: [DiscoveredSkill(name=last_dir, path=path)],
                     },
                 )
             ]
@@ -271,7 +276,7 @@ async def client_to_inspect_from_path(
                 client_path=parent_of_skill_directory,
                 mcp_configs={},
                 skills_dirs={
-                    parent_of_skill_directory: [(skill_directory, SkillServer(path=os.path.dirname(path)))],
+                    parent_of_skill_directory: [DiscoveredSkill(name=skill_directory, path=os.path.dirname(path))],
                 },
             )
         ]
