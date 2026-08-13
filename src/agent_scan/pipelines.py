@@ -42,6 +42,7 @@ class AnalyzeArgs(BaseModel):
     additional_headers: dict | None = None
     max_retries: int = 3
     skip_ssl_verify: bool = False
+    show_results: bool = False
 
 
 class PushArgs(BaseModel):
@@ -206,6 +207,7 @@ async def inspect_analyze_push_pipeline(
         skip_ssl_verify=analyze_args.skip_ssl_verify,
         scan_context=scan_context,
         scanned_usernames=scanned_usernames,
+        show_results=analyze_args.show_results,
     )
 
     return response

@@ -227,6 +227,12 @@ def add_common_arguments(parser):
         help="Scan all users on the machine.",
     )
     parser.add_argument(
+        "--show-results",
+        action="store_true",
+        default=False,
+        help="Show the scan results. Overrides the default behavior when using push keys.",
+    )
+    parser.add_argument(
         "--ci",
         action="store_true",
         default=False,
@@ -705,6 +711,11 @@ async def evo(args):
         rich.print(f"[bold red]Error revoking client_id[/bold red]: {e}")
 
 
+def _should_show_results(args) -> bool:
+    """Show results (force synchronous analysis) for evo, CI, or --show-results."""
+    return getattr(args, "command", None) == "evo" or getattr(args, "ci", False) or getattr(args, "show_results", False)
+
+
 async def run_scan(args, mode: Literal["scan", "inspect"] = "scan") -> ScanResponse | list[InspectedPath]:
     """
     Run the scan or inspect flow through their shared discovery and consent setup.
@@ -768,12 +779,14 @@ async def run_scan(args, mode: Literal["scan", "inspect"] = "scan") -> ScanRespo
         control_servers: list[ControlServer] = args.control_servers if hasattr(args, "control_servers") else []
         # For the analysis backend, pick the first identifier from control_servers
         identifier: str | None = next((s.identifier for s in control_servers), None)
+
         analyze_args = AnalyzeArgs(
             analysis_url=args.analysis_url,
             identifier=identifier,
             additional_headers=parse_headers(args.verification_H),
             max_retries=3,
             skip_ssl_verify=skip_ssl_verify,
+            show_results=_should_show_results(args),
         )
         push_args = PushArgs(
             control_servers=control_servers,

@@ -1123,6 +1123,38 @@ class TestAnalyzeMachineAsyncRouting:
         assert call[1]["headers"]["X-Push-Key"] == "push-abc"
         assert result == ScanResponse(scan_path_responses=[ScanPathResponse(path="/test/path")])
 
+    @pytest.mark.asyncio
+    async def test_show_results_skips_async_check_even_with_push_key(self):
+        """show_results=True must go straight to sync without ever probing the async-enabled config
+        endpoint, even for a push-key tenant that would otherwise route to async."""
+        inspected_paths = [InspectedPath(path="/test/path")]
+
+        with (
+            patch(
+                "agent_scan.verify_api._async_analysis_enabled", new_callable=AsyncMock, return_value=True
+            ) as mock_enabled,
+            patch("agent_scan.verify_api._submit_async_analysis", new_callable=AsyncMock) as mock_submit,
+            patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_session_class,
+        ):
+            mock_session_class.return_value = _make_sync_ok_session()
+            result = await analyze_machine(
+                inspected_paths=inspected_paths,
+                analysis_url=self._ANALYSIS_URL,
+                identifier=None,
+                push_key="push-abc",
+                show_results=True,
+            )
+
+        # The async gate is never consulted and no async submission happens.
+        mock_enabled.assert_not_awaited()
+        mock_submit.assert_not_awaited()
+        # A synchronous request is made, keeping push-key auth and the un-rewritten analysis URL.
+        mock_session_class.assert_called_once()
+        call = mock_session_class.return_value.post.call_args
+        assert call[0][0] == self._ANALYSIS_URL
+        assert call[1]["headers"]["X-Push-Key"] == "push-abc"
+        assert result == ScanResponse(scan_path_responses=[ScanPathResponse(path="/test/path")])
+
 
 class TestBuildScanRequest:
     """The API boundary turns inspection-domain results into v2026-07-10 wire models."""

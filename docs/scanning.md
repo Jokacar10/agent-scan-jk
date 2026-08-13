@@ -74,6 +74,7 @@ The command structure and most options are shared by both versions:
 - **Skills:** included by default; use `--no-skills` for MCP-only scanning.
 - **`--ci`:** return a non-zero exit code when relevant findings or operational failures remain; use `--dangerously-run-mcp-servers` when consent cannot be provided interactively.
 - **`--json`:** print machine-readable output; see [JSON output](json-output.md) for the versioned schemas.
+- **`--show-results`:** force synchronous analysis so results are displayed for push-key scans, which otherwise submit asynchronously and return no local results. See [Push keys and results](cli-reference.md#push-keys-and-results).
 
 Common examples:
 
