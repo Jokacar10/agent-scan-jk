@@ -31,7 +31,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _parse(argv: list[str]) -> argparse.Namespace:
+def _parse(argv: list[str]) -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     """Parse ``argv`` (as sys.argv[1:]) and attach control_servers like main() does."""
     parser = _build_parser()
     args = parser.parse_args(argv)
