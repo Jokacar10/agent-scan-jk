@@ -21,6 +21,7 @@ from agent_scan.models import (
     ScanResponse,
     TokenAndClientInfo,
 )
+from agent_scan.redact import redact_inspected_path
 from agent_scan.utils import get_push_key, get_readable_home_directories
 from agent_scan.verify_api import analyze_machine
 from agent_scan.well_known_clients import get_well_known_clients
@@ -162,6 +163,12 @@ async def inspect_pipeline(
                 do_stdio_handshake=do_stdio_handshake,
             )
         )
+    # redact: applied here so every caller of inspect_pipeline (both `mcp-scan
+    # scan` and `mcp-scan inspect`) gets sanitized results, since `inspect`
+    # prints/dumps them directly without going through the analyze/push
+    # pipeline's API-boundary sanitization.
+    inspected_paths = [redact_inspected_path(path) for path in inspected_paths]
+
     return inspected_paths, scanned_usernames or []
 
 
