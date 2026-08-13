@@ -17,6 +17,8 @@ from detect_secrets.plugins.high_entropy_strings import HighEntropyStringsPlugin
 from detect_secrets.plugins.keyword import KeywordDetector
 from detect_secrets.settings import default_settings, get_plugins, transient_settings
 
+from agent_scan.models.errors import ScanError
+from agent_scan.models.inspect import InspectedPath, InspectedServer
 from agent_scan.models.mcp import RemoteServer, StdioServer
 
 logger = logging.getLogger(__name__)
@@ -112,6 +114,25 @@ def _build_detect_secrets_config() -> dict:
 
 
 _DETECT_SECRETS_CONFIG: dict = _build_detect_secrets_config()
+
+# Lazily-built, process-wide cache of the plugin list for _DETECT_SECRETS_CONFIG.
+# Plugin instances are self-contained after construction (their regexes/config are
+# bound at init -- see _detect_secret's docstring on reusing an already-built
+# ``plugins`` list outside its constructing context), so building them once and
+# reusing across every redact_text() call is safe. This avoids re-entering
+# transient_settings per call: its cache_bust() (on both enter and exit, ~1.3ms
+# each) would otherwise run once per redact_text() call, which redact_error_text
+# makes twice per failing server (traceback + server_output) -- real overhead
+# when a scan has many failing servers.
+_CACHED_PLUGINS: list | None = None
+
+
+def _get_cached_plugins() -> list:
+    global _CACHED_PLUGINS
+    if _CACHED_PLUGINS is None:
+        with transient_settings(_DETECT_SECRETS_CONFIG):
+            _CACHED_PLUGINS = list(get_plugins())
+    return _CACHED_PLUGINS
 
 
 def _redaction_marker(plugin_name: str) -> str:
@@ -582,15 +603,28 @@ def redact_text(text: str | None) -> str | None:
     remove context the downstream analysis relies on. Error paths are sanitized
     separately at the API boundary, where they are noise rather than user content.
 
-    Detection runs line by line so the plugin set is built once and reused;
-    secret values are spliced out in place (see :func:`_redact_secrets_in_line`).
-    Returns ``None`` for ``None`` input and the input unchanged when it is empty.
+    Detection runs line by line against the process-wide cached plugin set (see
+    :func:`_get_cached_plugins`); secret values are spliced out in place (see
+    :func:`_redact_secrets_in_line`). Returns ``None`` for ``None`` input and the
+    input unchanged when it is empty.
     """
     if not text:
         return text
-    with transient_settings(_DETECT_SECRETS_CONFIG):
-        plugins = list(get_plugins())
-        return "\n".join(_redact_secrets_in_line(line, plugins) for line in text.split("\n"))
+    plugins = _get_cached_plugins()
+    return "\n".join(_redact_secrets_in_line(line, plugins) for line in text.split("\n"))
+
+
+def redact_error_text(text: str | None) -> str | None:
+    """Redact a traceback or captured server output string.
+
+    These fields are diagnostic noise, not user content, so both absolute
+    paths and secret-shaped values are stripped: a traceback can embed a
+    local filesystem layout, and captured protocol traffic / stderr
+    (``server_output``) can echo back a header, token, or other secret a
+    misbehaving server included in its response. Paths are stripped first
+    so the subsequent detect-secrets pass runs over already-shortened text.
+    """
+    return redact_text(redact_absolute_paths(text))
 
 
 def redact_server_config(server: StdioServer | RemoteServer) -> StdioServer | RemoteServer:
@@ -659,3 +693,46 @@ def redact_data(data: dict, redact_patterns: list[re.Pattern[str]]) -> dict:
 
     _walk(data)
     return data
+
+
+def _redact_scan_error_in_place(error: ScanError | None) -> None:
+    """Redact the traceback and server output of a ``ScanError`` in place.
+
+    Only these two fields are touched: they are diagnostic noise (a local
+    filesystem layout, captured stderr/protocol traffic), not user content,
+    so they are safe to sanitize with :func:`redact_error_text`. ``message``
+    and ``exception`` are left as-is here, matching the analyze/push API
+    boundary's own error sanitization in ``models/api/v20260710.py``.
+    """
+    if error is None:
+        return
+    error.traceback = redact_error_text(error.traceback)
+    error.server_output = redact_error_text(error.server_output)
+
+
+def redact_inspected_server(inspected: InspectedServer) -> InspectedServer:
+    """Redact sensitive values from one ``InspectedServer`` in place.
+
+    Redacts the server config (env/args/headers/URL query params, via
+    :func:`redact_server_config`) and the server-level error's traceback and
+    server output.
+    """
+    redact_server_config(inspected.server)
+    _redact_scan_error_in_place(inspected.error)
+    return inspected
+
+
+def redact_inspected_path(path: InspectedPath) -> InspectedPath:
+    """Redact sensitive information from an ``InspectedPath`` in place.
+
+    ``mcp-scan inspect`` prints/dumps ``InspectedPath`` results directly,
+    without going through the analyze/push pipeline's API-boundary
+    sanitization (``_server_for_request`` / ``_error_for_request`` in
+    ``models/api/v20260710.py``). This applies the equivalent local
+    redaction so every caller of ``inspect_pipeline`` -- both `mcp-scan
+    scan` and `mcp-scan inspect` -- gets sanitized results.
+    """
+    _redact_scan_error_in_place(path.error)
+    for server in path.servers:
+        redact_inspected_server(server)
+    return path

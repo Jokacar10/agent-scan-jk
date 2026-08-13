@@ -3,14 +3,17 @@
 import re
 import subprocess
 import sys
+from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 
+from agent_scan.models import InspectedPath, InspectedServer, RemoteServer, ScanError, StdioServer
 from agent_scan.redact import (
     _is_uuid_like,
     redact_absolute_paths,
     redact_args,
     redact_data,
+    redact_inspected_path,
     redact_push_keys,
     redact_push_keys_in_data,
     redact_text,
@@ -598,18 +601,26 @@ class TestRedactText:
         assert lines[2] == "line three"
 
     def test_redact_text_enters_detect_secrets_context_once(self, monkeypatch):
-        """redact_text must enter the detect-secrets settings context exactly
-        once for the whole text, not once per token.
+        """redact_text must enter the detect-secrets settings context at most
+        once for the whole text (to build the process-wide cached plugin list
+        the first time it's needed), never once per token or once per call.
 
         Re-entering ``transient_settings`` runs detect-secrets' ``cache_bust``
-        twice each time (~1.3ms), so a per-token re-entry makes redaction
-        O(tokens) -- a large bundled script then takes tens of seconds. The
-        per-token detection path must reuse the already-built plugin set under
-        the single outer context instead.
+        twice each time (~1.3ms), so a per-token (or per-call) re-entry makes
+        redaction O(tokens) / O(calls) -- costly for a large bundled script, or
+        for many failing servers each redacting a traceback/server_output. The
+        per-token detection path must reuse the already-built (and cached)
+        plugin set under at most one outer context instead.
         """
         import contextlib
 
         import agent_scan.redact as redact_mod
+
+        # Force a rebuild for this test regardless of what earlier tests in
+        # this process already primed, so the "once" assertion below is
+        # meaningful rather than trivially satisfied by the cache already
+        # being warm.
+        monkeypatch.setattr(redact_mod, "_CACHED_PLUGINS", None)
 
         real_transient_settings = redact_mod.transient_settings
         entries = 0
@@ -634,6 +645,11 @@ class TestRedactText:
         # ...and detection still works under the single-context path.
         assert FAKE_API_KEY not in result
         assert "**REDACTED_SECRET_" in result
+
+        # A second, independent call reuses the now-cached plugin list instead
+        # of re-entering transient_settings again.
+        redact_mod.redact_text(f"another secret: {FAKE_API_KEY}")
+        assert entries == 1
 
     @pytest.mark.parametrize(
         "wrapped",
@@ -739,6 +755,235 @@ class TestRedactText:
         delimited text: paths, versions, IPs, dotted names, and secret-free URLs
         are returned unchanged."""
         assert redact_text(benign) == benign
+
+
+def test_redact_inspected_path_remote_url_query_and_headers():
+    """
+    Ensure RemoteServer headers are redacted and URL query parameter values are replaced with REDACTED.
+    """
+    path = InspectedPath(
+        path="/dummy/path",
+        servers=[
+            InspectedServer(
+                name="remote",
+                server=RemoteServer(
+                    url="https://api.example.com/endpoint?token=abc123&api_key=xyz",
+                    type="http",
+                    headers={"Authorization": "Bearer secret", "X-Custom": "value"},
+                ),
+            )
+        ],
+    )
+
+    path = redact_inspected_path(path)
+
+    assert path.servers is not None and len(path.servers) == 1
+    srv = path.servers[0]
+    assert isinstance(srv.server, RemoteServer)
+    assert srv.server.headers["Authorization"] == "**REDACTED**"
+    assert srv.server.headers["X-Custom"] == "**REDACTED**"
+    parts = urlsplit(srv.server.url)
+    qs = dict(parse_qsl(parts.query, keep_blank_values=True))
+    assert qs.get("token") == "**REDACTED**"
+    assert qs.get("api_key") == "**REDACTED**"
+
+
+def test_redact_inspected_path_stdio_env_vars():
+    """
+    Ensure StdioServer environment variable values are redacted via redact_inspected_path.
+    """
+    path = InspectedPath(
+        path="/dummy/path",
+        servers=[
+            InspectedServer(
+                name="stdio",
+                server=StdioServer(
+                    command="echo",
+                    args=["hello"],
+                    env={"SECRET": "shh", "API_TOKEN": "tok"},
+                ),
+            )
+        ],
+    )
+
+    path = redact_inspected_path(path)
+
+    assert path.servers is not None and len(path.servers) == 1
+    srv = path.servers[0]
+    assert isinstance(srv.server, StdioServer)
+    assert srv.server.env["SECRET"] == "**REDACTED**"
+    assert srv.server.env["API_TOKEN"] == "**REDACTED**"
+
+
+def test_redact_inspected_path_stdio_args():
+    """
+    Ensure StdioServer argument values are redacted via redact_inspected_path.
+
+    -y is a boolean flag; the package name is preserved; only high-entropy
+    secret values are redacted (via detect-secrets).
+    """
+    path = InspectedPath(
+        path="/dummy/path",
+        servers=[
+            InspectedServer(
+                name="stdio",
+                server=StdioServer(
+                    command="npx",
+                    args=["-y", "some-server", "--api-key", FAKE_API_KEY, f"--token={FAKE_API_KEY}"],
+                    env={},
+                ),
+            )
+        ],
+    )
+
+    path = redact_inspected_path(path)
+
+    assert path.servers is not None and len(path.servers) == 1
+    srv = path.servers[0]
+    assert isinstance(srv.server, StdioServer)
+    assert srv.server.args is not None
+    assert srv.server.args[:3] == ["-y", "some-server", "--api-key"]
+    assert is_secret_marker(srv.server.args[3])
+    flag, sep, value = srv.server.args[4].partition("=")
+    assert (flag, sep) == ("--token", "=")
+    assert is_secret_marker(value)
+    assert FAKE_API_KEY not in " ".join(srv.server.args)
+
+
+@pytest.mark.parametrize(
+    "server,kind",
+    [
+        (
+            InspectedServer(
+                name="Weather",
+                server=StdioServer(
+                    command="uv run python",
+                    args=["tests/mcp_servers/weather_server.py"],
+                    env={"API_KEY": FAKE_API_KEY},
+                ),
+            ),
+            "env",
+        ),
+        (
+            InspectedServer(
+                name="Math",
+                server=StdioServer(
+                    command="uv run python",
+                    args=["tests/mcp_servers/math_server.py", f"--api-key={FAKE_API_KEY}"],
+                ),
+            ),
+            "args",
+        ),
+    ],
+)
+def test_redact_inspected_path_removes_api_key(server, kind):
+    """
+    Ensure redact_inspected_path removes API keys from server configs.
+
+    Env-var values use the legacy REDACTED constant (sibling-constant
+    preservation); CLI arg values use the plugin-named REDACTED_SECRET
+    marker.
+    """
+    path = InspectedPath(path="/dummy/path", servers=[server])
+
+    redacted = redact_inspected_path(path)
+    dump = redacted.model_dump_json()
+
+    assert FAKE_API_KEY not in dump
+
+    srv = redacted.servers[0]
+    assert isinstance(srv.server, StdioServer)
+    if kind == "env":
+        assert srv.server.env is not None
+        assert srv.server.env["API_KEY"] == "**REDACTED**"
+    else:
+        # args case: --api-key=<FAKE_API_KEY> becomes --api-key=<marker>.
+        # FAKE_API_KEY absence is already asserted on the dump above.
+        assert srv.server.args is not None
+        flag, sep, value = srv.server.args[-1].partition("=")
+        assert (flag, sep) == ("--api-key", "=")
+        assert is_secret_marker(value)
+
+
+class TestRedactErrorText:
+    """redact_inspected_path / redact_inspected_server must scrub secrets --
+    not just absolute paths -- out of tracebacks and captured server_output,
+    since a misbehaving server can echo a header/token back into either."""
+
+    def test_path_level_traceback_redacts_secret_and_path(self):
+        path = InspectedPath(
+            path="/dummy/path",
+            error=ScanError(
+                message="boom",
+                traceback=(
+                    f"Traceback (most recent call last):\n"
+                    f'  File "/Users/alice/project/agent_scan/inspect.py", line 42, in run\n'
+                    f"    raise RuntimeError(f'auth failed with key {FAKE_API_KEY}')\n"
+                    f"RuntimeError: auth failed with key {FAKE_API_KEY}"
+                ),
+            ),
+        )
+
+        redacted = redact_inspected_path(path)
+
+        assert FAKE_API_KEY not in redacted.error.traceback
+        assert "/Users/alice/project/agent_scan/inspect.py" not in redacted.error.traceback
+        assert is_secret_marker(
+            next(tok for tok in redacted.error.traceback.split() if is_secret_marker(tok.rstrip("'")))
+        )
+
+    def test_server_level_traceback_redacts_secret(self):
+        path = InspectedPath(
+            path="/dummy/path",
+            servers=[
+                InspectedServer(
+                    name="stdio",
+                    server=StdioServer(command="npx", args=["some-server"]),
+                    error=ScanError(
+                        message="startup failed",
+                        traceback=f"ConnectionError: token={FAKE_API_KEY} rejected",
+                    ),
+                )
+            ],
+        )
+
+        redacted = redact_inspected_path(path)
+
+        assert FAKE_API_KEY not in redacted.servers[0].error.traceback
+
+    def test_server_output_redacts_secret_and_path(self):
+        path = InspectedPath(
+            path="/dummy/path",
+            servers=[
+                InspectedServer(
+                    name="stdio",
+                    server=StdioServer(command="npx", args=["some-server"]),
+                    error=ScanError(
+                        message="startup failed",
+                        server_output=(
+                            f"stderr: loading /home/alice/.config/server/secrets.json\n"
+                            f'>>> {{"headers": {{"Authorization": "Bearer {FAKE_API_KEY}"}}}}'
+                        ),
+                    ),
+                )
+            ],
+        )
+
+        redacted = redact_inspected_path(path)
+
+        assert FAKE_API_KEY not in redacted.servers[0].error.server_output
+        assert "/home/alice/.config/server/secrets.json" not in redacted.servers[0].error.server_output
+
+    def test_none_traceback_and_server_output_are_left_alone(self):
+        path = InspectedPath(
+            path="/dummy/path",
+            servers=[InspectedServer(name="stdio", server=StdioServer(command="npx"))],
+        )
+
+        redacted = redact_inspected_path(path)
+
+        assert redacted.error is None
+        assert redacted.servers[0].error is None
 
 
 # ---------------------------------------------------------------------------
