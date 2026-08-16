@@ -7,6 +7,7 @@ import pytest
 
 from agent_scan.cli import (
     MissingIdentifierError,
+    _coerce_config_value,
     apply_config_file,
     control_servers_from_config,
     explicitly_provided_dests,
@@ -258,6 +259,108 @@ class TestApplyConfigFileRepeatableHeaders:
         apply_config_file(parser, args, argv)
         assert args.verification_H == ["X-From-Cli: only"]
         assert all("Yaml" not in h for h in args.verification_H)
+
+
+def _action(parser: argparse.ArgumentParser, dest: str):
+    return {a.dest: a for a in parser._actions}[dest]
+
+
+class TestConfigValueCoercion:
+    """apply_config_file must validate/convert YAML values the way argparse would,
+    rather than a raw setattr — type converters, choices, and scalar-vs-list shape."""
+
+    # --- The reported bug: a stringy boolean must not be silently truthy. ---
+    def test_boolean_flag_string_false_normalized(self, tmp_path):
+        # skip_ssl_verify is store_true; "false" must become the bool False.
+        path = _write_yaml(tmp_path, 'skip_ssl_verify: "false"\n')
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.skip_ssl_verify is False
+
+    def test_boolean_flag_native_bool_kept(self, tmp_path):
+        path = _write_yaml(tmp_path, "skip_ssl_verify: true\n")
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.skip_ssl_verify is True
+
+    def test_boolean_flag_rejects_non_bool_non_str(self, tmp_path):
+        # A list is neither a bool nor a stringy bool → exit 2.
+        path = _write_yaml(tmp_path, "skip_ssl_verify:\n  - 1\n")
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        with pytest.raises(SystemExit) as exc:
+            apply_config_file(parser, args, argv)
+        assert exc.value.code == 2
+
+    # --- Scalar type conversion via action.type (e.g. str2bool, float). ---
+    def test_scalar_str2bool_type_applied_to_string(self, tmp_path):
+        # suppress_mcpserver_io uses type=str2bool; "false" → False.
+        path = _write_yaml(tmp_path, 'suppress_mcpserver_io: "false"\n')
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.suppress_mcpserver_io is False
+
+    def test_scalar_numeric_string_converted(self, tmp_path):
+        path = _write_yaml(tmp_path, 'server_timeout: "30"\n')
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.server_timeout == 30.0
+        assert isinstance(args.server_timeout, float)
+
+    def test_scalar_invalid_conversion_exits_2(self, tmp_path):
+        path = _write_yaml(tmp_path, 'server_timeout: "not-a-number"\n')
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        with pytest.raises(SystemExit) as exc:
+            apply_config_file(parser, args, argv)
+        assert exc.value.code == 2
+
+    def test_scalar_rejects_collection_shape(self, tmp_path):
+        # analysis_url is scalar; a list is a shape mismatch → exit 2.
+        path = _write_yaml(tmp_path, "analysis_url:\n  - https://a\n  - https://b\n")
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        with pytest.raises(SystemExit) as exc:
+            apply_config_file(parser, args, argv)
+        assert exc.value.code == 2
+
+    # --- List-shaped options require a list (a lone scalar is wrapped). ---
+    def test_list_scalar_wrapped(self, tmp_path):
+        path = _write_yaml(tmp_path, 'verification_H: "X-One: 1"\n')
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.verification_H == ["X-One: 1"]
+
+    def test_list_rejects_mapping(self, tmp_path):
+        path = _write_yaml(tmp_path, "verification_H:\n  a: b\n")
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        with pytest.raises(SystemExit) as exc:
+            apply_config_file(parser, args, argv)
+        assert exc.value.code == 2
+
+    def test_positional_files_rejects_mapping(self, tmp_path):
+        path = _write_yaml(tmp_path, "files:\n  a: b\n")
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        with pytest.raises(SystemExit) as exc:
+            apply_config_file(parser, args, argv)
+        assert exc.value.code == 2
+
+    # --- choices membership is enforced (uses a purpose-built action). ---
+    def test_choices_enforced(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--mode", choices=["a", "b"])
+        action = _action(parser, "mode")
+        assert _coerce_config_value(action, "mode", "a") == "a"
+        with pytest.raises(SystemExit) as exc:
+            _coerce_config_value(action, "mode", "c")
+        assert exc.value.code == 2
 
 
 class TestApplyConfigFileFiles:

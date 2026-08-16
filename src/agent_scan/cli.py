@@ -1,7 +1,7 @@
 # fix ssl certificates if custom certificates (i.e. ZScaler) are used
 # as this needs to occur at the beginning of the file, we need to disable the ruff rule
 # ruff: noqa: E402
-from typing import Literal, cast
+from typing import Literal, NoReturn, cast
 
 import truststore
 
@@ -200,7 +200,7 @@ def explicitly_provided_dests(parser: argparse.ArgumentParser, argv: list[str]) 
     return provided
 
 
-def _fail_config(message: str) -> None:
+def _fail_config(message: str) -> NoReturn:
     """Print a config-file error to stderr and exit with the CLI's usage code."""
     rich.print(f"[bold red]{message}[/bold red]", file=sys.stderr)
     sys.exit(2)
@@ -261,6 +261,71 @@ def control_servers_from_config(raw) -> list[ControlServer]:
     return control_servers
 
 
+def _convert_config_scalar(action: argparse.Action, raw_key: str, value: object) -> object:
+    """
+    Apply the action's ``type`` converter to a single YAML scalar and enforce
+    ``choices`` — the same validation argparse would run on a CLI token.
+
+    ``type`` converters (e.g. ``str2bool``, ``int``, ``float``) accept a string,
+    so we only invoke them when the YAML value is a string; a value already
+    parsed by YAML into the target native type (``server_timeout: 30``) is kept
+    as-is. Exits with code 2 on a failed conversion or an out-of-choices value.
+    """
+    converted = value
+    # argparse's ``type`` may be a registered type name (str) rather than a
+    # callable; guard with callable() so we only invoke real converters.
+    if callable(action.type) and isinstance(value, str):
+        try:
+            converted = action.type(value)
+        except (ValueError, TypeError) as exc:
+            _fail_config(f"Invalid value for '{raw_key}' in the config file: {value!r} ({exc}).")
+    if action.choices is not None and converted not in action.choices:
+        allowed = ", ".join(str(c) for c in action.choices)
+        _fail_config(f"Invalid value for '{raw_key}' in the config file: {converted!r}. Choose from: {allowed}.")
+    return converted
+
+
+def _coerce_config_value(action: argparse.Action, raw_key: str, value: object) -> object:
+    """
+    Validate/convert a YAML value so it behaves like the equivalent CLI flag,
+    reusing argparse's expectations rather than a raw ``setattr``.
+
+    - Boolean flags (``store_true``/``store_false``/``BooleanOptionalAction``,
+      i.e. ``nargs == 0``): require a ``bool``, or a string normalized via
+      ``str2bool``; anything else is rejected. This stops values like
+      ``skip_ssl_verify: "false"`` from being silently truthy.
+    - List-shaped options (``append`` actions and ``nargs`` ``*``/``+`` such as
+      ``verification_H`` and the positional ``files``): require a list; a lone
+      scalar is wrapped into a one-element list; each element is type-converted.
+    - Plain scalars: reject collections (shape mismatch), then type-convert and
+      choice-check.
+
+    Exits with code 2 via ``_fail_config`` on any type/shape violation.
+    """
+    # store_true / store_false / BooleanOptionalAction consume no argument.
+    if action.nargs == 0:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return str2bool(value)
+        _fail_config(f"'{raw_key}' in the config file expects a boolean, got {type(value).__name__}.")
+
+    # append options and nargs '*'/'+' are list-shaped.
+    if isinstance(action, argparse._AppendAction) or action.nargs in ("*", "+"):
+        if isinstance(value, list):
+            items: list = value
+        elif isinstance(value, str | int | float | bool):
+            items = [value]  # accept a lone scalar as a single-element list
+        else:
+            _fail_config(f"'{raw_key}' in the config file expects a list, got {type(value).__name__}.")
+        return [_convert_config_scalar(action, raw_key, item) for item in items]
+
+    # Plain scalar option.
+    if isinstance(value, list | dict):
+        _fail_config(f"'{raw_key}' in the config file expects a single value, not a {type(value).__name__}.")
+    return _convert_config_scalar(action, raw_key, value)
+
+
 def apply_config_file(parser: argparse.ArgumentParser, args: argparse.Namespace, argv: list[str]) -> None:
     """
     Merge values from ``args.config_file`` into ``args``.
@@ -286,7 +351,8 @@ def apply_config_file(parser: argparse.ArgumentParser, args: argparse.Namespace,
     if getattr(args, "files", None):
         explicit.add("files")
 
-    valid_dests = {a.dest for a in _iter_all_actions(parser) if a.dest not in (argparse.SUPPRESS, "help")}
+    dest_to_action = {a.dest: a for a in _iter_all_actions(parser)}
+    valid_dests = {dest for dest in dest_to_action if dest not in (argparse.SUPPRESS, "help")}
 
     # control_servers is assembled outside argparse (see parse_control_servers),
     # so it is handled here with complete-replacement semantics.
@@ -311,7 +377,9 @@ def apply_config_file(parser: argparse.ArgumentParser, args: argparse.Namespace,
             continue
         if key in explicit:
             continue  # explicit CLI flag wins over the config file (whole value)
-        setattr(args, key, value)
+        # Validate/convert exactly as argparse would for the equivalent CLI flag
+        # (type converters, choices, scalar-vs-list shape) before assigning.
+        setattr(args, key, _coerce_config_value(dest_to_action[key], raw_key, value))
 
 
 def add_common_arguments(parser):

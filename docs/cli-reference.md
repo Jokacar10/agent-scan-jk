@@ -259,6 +259,8 @@ Load argument values from a YAML file instead of passing them all on the command
 
 **Keys.** Use the flag's long name with dashes or underscores — `server-timeout` and `server_timeout` are equivalent. Values are native YAML types (`true`/`false`, numbers, strings, lists), so `--suppress-mcpserver-io` becomes `suppress_mcpserver_io: true` and `--dangerously-run-mcp-servers` becomes `dangerously_run_mcp_servers: true`. Unknown keys are ignored with a warning on stderr.
 
+**Validation.** Values are checked the same way argparse checks CLI input: the flag's type converter is applied, `choices` are enforced, and boolean/scalar/list shapes must match (a boolean flag rejects non-boolean values, a list option rejects a mapping, etc.). String forms of booleans are normalized (`skip_ssl_verify: "false"` → `false`). An invalid type, value, or shape exits with code **2**.
+
 **Scalars vs. blocks/lists.** Scalar options (`server_timeout`, `analysis_url`, booleans, …) override field-by-field. Block/list options — the positional `files`, repeatable headers like `verification_H`, and the `control_servers` block — use **complete replacement**: if you pass *any* CLI flag for that structure, the file's entire array for it is discarded (no element-wise merge) and rebuilt from the CLI alone.
 
 **Control servers.** The `--control-server` / `--control-server-H` / `--control-identifier` block is expressed as a `control_servers` list; `headers` may be a mapping or a list of `Name: value` strings. Passing any one of those three flags on the CLI replaces the whole `control_servers` list from the file.
