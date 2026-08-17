@@ -907,8 +907,8 @@ def main():
     # Parse control servers before argparse to preserve their grouping
     try:
         control_servers = parse_control_servers(sys.argv)
-    except MissingIdentifierError as exc:
-        _fail_config(str(exc))
+    except MissingIdentifierError:
+        sys.exit(1)
 
     args = parser.parse_args()
 
