@@ -303,6 +303,7 @@ snyk-agent-scan scan --config-file agent-scan.yaml \
 > Notes:
 > - `skills` is on by default. In YAML, set `skills: false` to disable skill scanning (equivalent to `--no-skills`); there is no separate `no_skills` toggle — the `skills` key is the single source of truth.
 > - `dangerously_run_mcp_servers: true` in the file has the same effect as the flag, including satisfying the `--ci` requirement that it be set — a config file can therefore enable stdio MCP server execution. This is intended, but review config files with that in mind.
+> - **On/off flags set to `true` in a file cannot be turned off on the command line.** Flags such as `json`, `scan_all_users`, and `dangerously_run_mcp_servers` are `store_true` and have no `--no-…` counterpart, so once a config file sets them to `true` there is no CLI flag to override them back to `false` for a single run — edit or omit the file instead. (`skills` is the exception: it has `--no-skills`.)
 
 ---
 

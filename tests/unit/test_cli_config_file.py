@@ -6,7 +6,6 @@ import argparse
 import pytest
 
 from agent_scan.cli import (
-    MissingIdentifierError,
     _coerce_config_value,
     apply_config_file,
     control_servers_from_config,
@@ -130,13 +129,41 @@ class TestControlServersFromConfig:
             ControlServer(url="https://s1.com", headers={"Auth": " token1"}, identifier="user1")
         ]
 
-    def test_missing_identifier_raises(self):
-        with pytest.raises(MissingIdentifierError):
+    def test_missing_identifier_exits_2(self):
+        # Config path emits a concise message and exits 2 (no traceback).
+        with pytest.raises(SystemExit) as exc:
             control_servers_from_config([{"url": "https://s1.com"}])
+        assert exc.value.code == 2
 
     def test_non_list_exits_2(self):
         with pytest.raises(SystemExit) as exc:
             control_servers_from_config({"url": "https://s1.com"})
+        assert exc.value.code == 2
+
+    def test_entry_not_mapping_exits_2(self):
+        with pytest.raises(SystemExit) as exc:
+            control_servers_from_config(["not-a-mapping"])
+        assert exc.value.code == 2
+
+    def test_missing_url_exits_2(self):
+        with pytest.raises(SystemExit) as exc:
+            control_servers_from_config([{"identifier": "user1"}])
+        assert exc.value.code == 2
+
+    def test_invalid_header_string_exits_2(self):
+        with pytest.raises(SystemExit) as exc:
+            control_servers_from_config([{"url": "https://s1.com", "identifier": "u", "headers": ["no-colon"]}])
+        assert exc.value.code == 2
+
+    def test_headers_wrong_type_exits_2(self):
+        with pytest.raises(SystemExit) as exc:
+            control_servers_from_config([{"url": "https://s1.com", "identifier": "u", "headers": 42}])
+        assert exc.value.code == 2
+
+    def test_non_string_identifier_exits_2(self):
+        # Pydantic rejects an int identifier; surface it as a clean exit 2.
+        with pytest.raises(SystemExit) as exc:
+            control_servers_from_config([{"url": "https://s1.com", "identifier": 123}])
         assert exc.value.code == 2
 
 
@@ -346,6 +373,15 @@ class TestConfigValueCoercion:
 
     def test_positional_files_rejects_mapping(self, tmp_path):
         path = _write_yaml(tmp_path, "files:\n  a: b\n")
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        with pytest.raises(SystemExit) as exc:
+            apply_config_file(parser, args, argv)
+        assert exc.value.code == 2
+
+    def test_non_string_yaml_key_exits_2(self, tmp_path):
+        # YAML permits non-string keys (e.g. `123:`); reject cleanly, don't crash.
+        path = _write_yaml(tmp_path, "123: true\n")
         argv = ["scan", "--config-file", path]
         parser, args = _parse(argv)
         with pytest.raises(SystemExit) as exc:

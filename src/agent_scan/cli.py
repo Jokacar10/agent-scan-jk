@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import psutil
 import rich
 import yaml
+from pydantic import ValidationError
 from rich.logging import RichHandler
 
 from agent_scan.consent import collect_consent
@@ -113,12 +114,31 @@ def str2bool(v: str) -> bool:
     return v.lower() in ("true", "1", "t", "y", "yes")
 
 
+def _expand_equals_tokens(argv: list[str]) -> list[str]:
+    """
+    Expand ``--flag=value`` into ``--flag``, ``value`` for the control-server
+    block flags so both spellings parse identically. The block parser below scans
+    for bare flag tokens, so ``--control-server=https://x`` would otherwise be one
+    token and silently yield no servers. Only the first ``=`` is split, preserving
+    ``=`` inside URLs/headers (e.g. ``?version=2``).
+    """
+    control_flags = ("--control-server", "--control-server-H", "--control-identifier")
+    expanded: list[str] = []
+    for token in argv:
+        if "=" in token and token.split("=", 1)[0] in control_flags:
+            expanded.extend(token.split("=", 1))
+        else:
+            expanded.append(token)
+    return expanded
+
+
 def parse_control_servers(argv) -> list[ControlServer]:
     """
     Parse control server arguments from sys.argv.
     Returns a list of ControlServer instances.
-    Raises ValueError if any control server is missing an identifier.
+    Raises MissingIdentifierError if any control server is missing an identifier.
     """
+    argv = _expand_equals_tokens(argv)
     server_starts = [i for i, arg in enumerate(argv) if arg == "--control-server"]
 
     control_servers: list[ControlServer] = []
@@ -235,28 +255,41 @@ def control_servers_from_config(raw) -> list[ControlServer]:
     ``"Name: value"`` strings (matching the ``--control-server-H`` CLI form).
     """
     if not isinstance(raw, list):
-        _fail_config("'control_servers' in the config file must be a list.")
+        _fail_config("Invalid config file: 'control_servers' must be a list.")
 
     control_servers: list[ControlServer] = []
     for entry in raw:
         if not isinstance(entry, dict):
-            _fail_config("Each entry under 'control_servers' must be a mapping.")
+            _fail_config("Invalid config file: each 'control_servers' entry must be a mapping.")
         url = entry.get("url")
         identifier = entry.get("identifier")
-        headers = entry.get("headers") or {}
-        if isinstance(headers, list):
-            headers = parse_headers(headers)
+        raw_headers = entry.get("headers") or {}
 
-        if not url:
-            _fail_config("A control server in the config file is missing a 'url'.")
+        if not url or not isinstance(url, str):
+            _fail_config("Invalid config file: a 'control_servers' entry is missing a string 'url'.")
         if identifier is None:
-            rich.print(
-                f"[bold red]Control server {url} in the config file is missing an 'identifier'.[/bold red]",
-                file=sys.stderr,
-            )
-            raise MissingIdentifierError(f"Control server {url} is missing an identifier")
+            _fail_config(f"Invalid config file: control server '{url}' is missing an 'identifier'.")
 
-        control_servers.append(ControlServer(url=url, headers=headers, identifier=identifier))
+        # Headers may be a mapping ({name: value}) or a list of "Name: value"
+        # strings (matching the --control-server-H CLI form).
+        if isinstance(raw_headers, dict):
+            headers = raw_headers
+        elif isinstance(raw_headers, list):
+            try:
+                headers = parse_headers(raw_headers)
+            except ValueError as exc:
+                _fail_config(f"Invalid config file: control server '{url}' has an invalid header ({exc}).")
+        else:
+            _fail_config(
+                f"Invalid config file: control server '{url}' 'headers' must be a mapping "
+                "or a list of 'Name: value' strings."
+            )
+
+        try:
+            control_servers.append(ControlServer(url=url, headers=headers, identifier=identifier))
+        except ValidationError as exc:
+            detail = exc.errors()[0].get("msg", "invalid value") if exc.errors() else "invalid value"
+            _fail_config(f"Invalid config file: control server '{url}' is invalid ({detail}).")
 
     return control_servers
 
@@ -278,10 +311,10 @@ def _convert_config_scalar(action: argparse.Action, raw_key: str, value: object)
         try:
             converted = action.type(value)
         except (ValueError, TypeError) as exc:
-            _fail_config(f"Invalid value for '{raw_key}' in the config file: {value!r} ({exc}).")
+            _fail_config(f"Invalid config file: '{raw_key}' has an invalid value {value!r} ({exc}).")
     if action.choices is not None and converted not in action.choices:
         allowed = ", ".join(str(c) for c in action.choices)
-        _fail_config(f"Invalid value for '{raw_key}' in the config file: {converted!r}. Choose from: {allowed}.")
+        _fail_config(f"Invalid config file: '{raw_key}' must be one of: {allowed}.")
     return converted
 
 
@@ -308,7 +341,7 @@ def _coerce_config_value(action: argparse.Action, raw_key: str, value: object) -
             return value
         if isinstance(value, str):
             return str2bool(value)
-        _fail_config(f"'{raw_key}' in the config file expects a boolean, got {type(value).__name__}.")
+        _fail_config(f"Invalid config file: '{raw_key}' must be a boolean.")
 
     # append options and nargs '*'/'+' are list-shaped.
     if isinstance(action, argparse._AppendAction) or action.nargs in ("*", "+"):
@@ -317,12 +350,12 @@ def _coerce_config_value(action: argparse.Action, raw_key: str, value: object) -
         elif isinstance(value, str | int | float | bool):
             items = [value]  # accept a lone scalar as a single-element list
         else:
-            _fail_config(f"'{raw_key}' in the config file expects a list, got {type(value).__name__}.")
+            _fail_config(f"Invalid config file: '{raw_key}' must be a list.")
         return [_convert_config_scalar(action, raw_key, item) for item in items]
 
     # Plain scalar option.
     if isinstance(value, list | dict):
-        _fail_config(f"'{raw_key}' in the config file expects a single value, not a {type(value).__name__}.")
+        _fail_config(f"Invalid config file: '{raw_key}' must be a single value, not a {type(value).__name__}.")
     return _convert_config_scalar(action, raw_key, value)
 
 
@@ -367,6 +400,10 @@ def apply_config_file(parser: argparse.ArgumentParser, args: argparse.Namespace,
     # list, never a per-element merge — the same semantics used for
     # ``control_servers`` above.
     for raw_key, value in config.items():
+        # YAML allows non-string keys (e.g. ``true:`` or ``1:``); reject them
+        # cleanly instead of crashing on ``.replace``.
+        if not isinstance(raw_key, str):
+            _fail_config(f"Invalid config file: keys must be strings, got {raw_key!r}.")
         key = raw_key.replace("-", "_")
         if key in ("control_servers", "config_file"):
             continue  # handled above / self-reference
@@ -868,7 +905,10 @@ def main():
         sys.argv.insert(1, "scan")
 
     # Parse control servers before argparse to preserve their grouping
-    control_servers = parse_control_servers(sys.argv)
+    try:
+        control_servers = parse_control_servers(sys.argv)
+    except MissingIdentifierError as exc:
+        _fail_config(str(exc))
 
     args = parser.parse_args()
 
