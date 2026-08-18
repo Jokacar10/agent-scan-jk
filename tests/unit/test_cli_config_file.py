@@ -413,3 +413,56 @@ class TestApplyConfigFileFiles:
         parser, args = _parse(argv)
         apply_config_file(parser, args, argv)
         assert args.files == ["/cli/config.json"]
+
+
+class TestApplyConfigFilePushKeyAndMachineId:
+    """--push-key / --machine-id (v0.6+) are ordinary scalar options, so they
+    are settable from the config file through the same generic mechanism as
+    any other flag (see TestApplyConfigFileScalars)."""
+
+    def test_push_key_and_machine_id_loaded_from_yaml(self, tmp_path):
+        path = _write_yaml(tmp_path, "push_key: yaml-push-key\nmachine_id: yaml-machine-id\n")
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.push_key == "yaml-push-key"
+        assert args.machine_id == "yaml-machine-id"
+
+    def test_explicit_cli_push_key_overrides_yaml(self, tmp_path):
+        path = _write_yaml(tmp_path, "push_key: yaml-push-key\n")
+        argv = ["scan", "--config-file", path, "--push-key", "cli-push-key"]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.push_key == "cli-push-key"
+
+    def test_explicit_cli_machine_id_overrides_yaml(self, tmp_path):
+        path = _write_yaml(tmp_path, "machine_id: yaml-machine-id\n")
+        argv = ["scan", "--config-file", path, "--machine-id", "cli-machine-id"]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.machine_id == "cli-machine-id"
+
+    def test_numeric_push_key_coerced_to_string(self, tmp_path):
+        # A bare numeric YAML scalar must be normalized to str, matching what
+        # a real CLI invocation would receive (argv tokens are always strings).
+        path = _write_yaml(tmp_path, "push_key: 12345\n")
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.push_key == "12345"
+        assert isinstance(args.push_key, str)
+
+    def test_numeric_machine_id_coerced_to_string(self, tmp_path):
+        path = _write_yaml(tmp_path, "machine_id: 12345\n")
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.machine_id == "12345"
+        assert isinstance(args.machine_id, str)
+
+    def test_empty_string_push_key_from_yaml_preserved(self, tmp_path):
+        path = _write_yaml(tmp_path, 'push_key: ""\n')
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.push_key == ""

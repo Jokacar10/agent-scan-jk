@@ -331,17 +331,22 @@ def _convert_config_scalar(action: argparse.Action, raw_key: str, value: object)
     Apply the action's ``type`` converter to a single YAML scalar and enforce
     ``choices`` — the same validation argparse would run on a CLI token.
 
-    ``type`` converters (e.g. ``str2bool``, ``int``, ``float``) accept a string,
-    so we only invoke them when the YAML value is a string; a value already
-    parsed by YAML into the target native type (``server_timeout: 30``) is kept
-    as-is. Exits with code 2 on a failed conversion or an out-of-choices value.
+    ``type`` converters (e.g. ``str2bool``, ``int``, ``float``, ``str``) always
+    receive a string on the CLI (argv tokens are strings), so we stringify a
+    non-string YAML value (e.g. ``push_key: 12345``, ``server_timeout: 30``)
+    before converting, rather than only converting when YAML already handed us
+    a string. This is a generic, type-agnostic rule that applies to every
+    scalar flag: it normalizes a numeric YAML value into the flag's real type
+    (``str`` for a string flag, ``float`` for ``server_timeout``, etc.)
+    instead of silently keeping the mismatched native YAML type. Exits with
+    code 2 on a failed conversion or an out-of-choices value.
     """
     converted = value
     # argparse's ``type`` may be a registered type name (str) rather than a
     # callable; guard with callable() so we only invoke real converters.
-    if callable(action.type) and isinstance(value, str):
+    if callable(action.type):
         try:
-            converted = action.type(value)
+            converted = action.type(value) if isinstance(value, str) else action.type(str(value))
         except (ValueError, TypeError) as exc:
             _fail_config(f"Invalid config file: '{raw_key}' has an invalid value {value!r} ({exc}).")
     if action.choices is not None and converted not in action.choices:
