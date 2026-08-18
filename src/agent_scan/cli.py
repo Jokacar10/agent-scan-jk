@@ -1045,7 +1045,8 @@ async def evo(args):
     if getattr(args, "push_key", None) is not None:
         rich.print(
             "[yellow]Note: evo always authenticates with a key it mints itself; "
-            "the --push-key you supplied will be ignored.[/yellow]"
+            "the --push-key you supplied will be ignored.[/yellow]",
+            file=sys.stderr,
         )
         args.push_key = None
 
