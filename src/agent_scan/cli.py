@@ -157,6 +157,38 @@ def parse_control_servers(argv) -> list[ControlServer]:
     return control_servers
 
 
+def _warn_deprecated_flag(flag_name: str, replacement: str) -> None:
+    rich.print(
+        f"[yellow]Warning: {flag_name} is deprecated and will be removed in a future release. "
+        f"Use {replacement} instead.[/yellow]",
+        file=sys.stderr,
+    )
+
+
+def warn_deprecated_control_flags(args) -> None:
+    """Warn once per invocation for each deprecated control-server flag used.
+
+    --control-server-H is a generic "additional header" flag, so it only
+    warns when it's actually carrying the x-client-id push-key trick, not
+    when it's used for an unrelated custom header. --control-identifier
+    warns on any use, even though --machine-id can only hold a single value
+    and can't represent the distinct identifiers a multi-control-server
+    setup requires — the warning still nudges toward the replacement for
+    the common single-server case.
+    """
+    raw_headers = getattr(args, "control_server_H", None)
+    if raw_headers:
+        try:
+            headers = parse_headers(raw_headers)
+        except ValueError:
+            headers = {}
+        if any("x-client-id" in header.lower() for header in headers):
+            _warn_deprecated_flag("--control-server-H", "--push-key")
+
+    if getattr(args, "control_identifier", None):
+        _warn_deprecated_flag("--control-identifier", "--machine-id")
+
+
 def add_common_arguments(parser):
     """Add arguments that are common to multiple commands."""
     parser.add_argument(
@@ -309,6 +341,20 @@ def add_control_server_arguments(parser):
             "Non-anonymous identifier for that control server (for example: email, hostname, serial number)."
         ),
     )
+    parser.add_argument(
+        "--push-key",
+        type=str,
+        default=None,
+        help="Push key used to authenticate with the analysis server.",
+        metavar="KEY",
+    )
+    parser.add_argument(
+        "--machine-id",
+        type=str,
+        default=None,
+        help="Non-anonymous identifier for this machine (for example: hostname, serial number). ",
+        metavar="ID",
+    )
 
 
 def add_scan_arguments(scan_parser):
@@ -360,6 +406,34 @@ def setup_scan_parser(scan_parser, add_files=True, add_ci_ignore_options=True, a
     add_scan_arguments(scan_parser)
 
 
+def _effective_push_key(args) -> str | None:
+    """Push key from --push-key, falling back to the deprecated --control-server-H
+    x-client-id header.
+
+    On evo, an externally-supplied --push-key is ignored: evo always
+    authenticates with the one-time key it mints and injects into
+    args.control_servers, so an outside value must never silently replace
+    it (both before minting, where it would wrongly suppress the upfront
+    tenant/token prompts, and after, where it would wrongly override the
+    minted key).
+    """
+    if getattr(args, "command", None) != "evo":
+        push_key = getattr(args, "push_key", None)
+        if push_key is not None:
+            return push_key
+    return get_push_key(getattr(args, "control_servers", []) or [])
+
+
+def _effective_identifier(args) -> str | None:
+    """Machine identifier from --machine-id, falling back to the deprecated
+    --control-identifier on the first control-server block."""
+    machine_id = getattr(args, "machine_id", None)
+    if machine_id is not None:
+        return machine_id
+    control_servers = getattr(args, "control_servers", None) or []
+    return next((s.identifier for s in control_servers), None)
+
+
 def is_interactive_run(args) -> bool:
     """
     True when the run is a manual, interactive invocation by a human who can
@@ -369,7 +443,7 @@ def is_interactive_run(args) -> bool:
     if command == "inspect":
         return True
     # If the scan is run with a push key, skip consent prompts.
-    has_push_key = bool(get_push_key(getattr(args, "control_servers", []) or []))
+    has_push_key = bool(_effective_push_key(args))
     return not has_push_key
 
 
@@ -410,7 +484,7 @@ def decide_handshake(args) -> HandshakeDecision:
     # inspect always qualifies.
     # scan / no-subcommand qualifies when there is no push key.
     is_attended_scan = command == "inspect" or (
-        (command is None or command == "scan") and not bool(get_push_key(getattr(args, "control_servers", []) or []))
+        (command is None or command == "scan") and not bool(_effective_push_key(args))
     )
     if is_attended_scan:
         return HandshakeDecision(do_stdio_handshake=True, collect_consent=True)
@@ -627,6 +701,8 @@ def main():
     # Attach parsed control servers to args
     args.control_servers = control_servers
 
+    warn_deprecated_control_flags(args)
+
     # Resolve deferred defaults and enforce safety rules before dispatching.
     resolve_server_io_default(args)
     enforce_consent_requirements(args)
@@ -673,6 +749,12 @@ async def evo(args):
     3. Revokes the client_id
     """
     from agent_scan.pushkeys import mint_push_key, revoke_push_key
+
+    if getattr(args, "push_key", None) is not None:
+        rich.print(
+            "[yellow]Note: evo always authenticates with a key it mints itself; "
+            "the --push-key you supplied will be ignored.[/yellow]"
+        )
 
     rich.print(
         "Go to https://app.snyk.io and select the tenant on the left nav bar. "
@@ -781,8 +863,12 @@ async def run_scan(args, mode: Literal["scan", "inspect"] = "scan") -> ScanRespo
         skip_ssl_verify: bool = bool(hasattr(args, "skip_ssl_verify") and args.skip_ssl_verify)
 
         control_servers: list[ControlServer] = args.control_servers if hasattr(args, "control_servers") else []
-        # For the analysis backend, pick the first identifier from control_servers
-        identifier: str | None = next((s.identifier for s in control_servers), None)
+        # --machine-id / --push-key take precedence over the deprecated
+        # --control-identifier / --control-server-H equivalents. Resolved once
+        # here so every downstream consumer (PushArgs, the pipeline) sees the
+        # same already-resolved value instead of re-deriving it.
+        identifier: str | None = _effective_identifier(args)
+        push_key: str | None = _effective_push_key(args)
 
         analyze_args = AnalyzeArgs(
             analysis_url=args.analysis_url,
@@ -794,6 +880,7 @@ async def run_scan(args, mode: Literal["scan", "inspect"] = "scan") -> ScanRespo
         )
         push_args = PushArgs(
             control_servers=control_servers,
+            push_key=push_key,
             skip_ssl_verify=skip_ssl_verify,
             version=version_info,
         )

@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from agent_scan.models import InspectedPath
+from agent_scan.models import ControlServer, InspectedPath
 from agent_scan.models.api.v20260710 import ScanPathResponse, ScanResponse
 from agent_scan.pipelines import AnalyzeArgs, InspectArgs, PushArgs, inspect_analyze_push_pipeline
 
@@ -29,3 +29,116 @@ async def test_scan_pipeline_returns_api_response():
     assert result is response
     inspect_pipeline.assert_awaited_once()
     assert analyze.await_args.args[0] is inspected_paths
+
+
+@pytest.mark.asyncio
+async def test_push_args_push_key_passed_through_verbatim():
+    """PushArgs.push_key is forwarded to analyze_machine exactly as given;
+    precedence between --push-key and the deprecated --control-server-H
+    x-client-id header is resolved upstream by the caller (cli.py's
+    _effective_push_key), not by this pipeline."""
+    inspected_paths = [InspectedPath(client="cursor", path="/config")]
+    response = ScanResponse(scan_path_responses=[ScanPathResponse(client="cursor", path="/config")])
+
+    with (
+        patch(
+            "agent_scan.pipelines.inspect_pipeline",
+            new_callable=AsyncMock,
+            return_value=(inspected_paths, ["alice"]),
+        ),
+        patch("agent_scan.pipelines.analyze_machine", new_callable=AsyncMock, return_value=response) as analyze,
+    ):
+        await inspect_analyze_push_pipeline(
+            InspectArgs(timeout=10, tokens=[], paths=[]),
+            AnalyzeArgs(analysis_url="https://test.example/api"),
+            PushArgs(
+                control_servers=[
+                    ControlServer(url="https://server1.com", headers={"x-client-id": "old-key"}, identifier="old-id")
+                ],
+                push_key="new-key",
+                version="0.6.0",
+            ),
+        )
+
+    assert analyze.await_args.kwargs["push_key"] == "new-key"
+
+
+@pytest.mark.asyncio
+async def test_push_args_push_key_none_is_not_derived_from_control_server_header():
+    """If the caller passes push_key=None, this pipeline does NOT fall back
+    to deriving it from the control_servers x-client-id header itself —
+    that resolution is the caller's responsibility (see cli.py's
+    _effective_push_key). A caller that skips resolving it gets None
+    forwarded, not a silently-derived value."""
+    inspected_paths = [InspectedPath(client="cursor", path="/config")]
+    response = ScanResponse(scan_path_responses=[ScanPathResponse(client="cursor", path="/config")])
+
+    with (
+        patch(
+            "agent_scan.pipelines.inspect_pipeline",
+            new_callable=AsyncMock,
+            return_value=(inspected_paths, ["alice"]),
+        ),
+        patch("agent_scan.pipelines.analyze_machine", new_callable=AsyncMock, return_value=response) as analyze,
+    ):
+        await inspect_analyze_push_pipeline(
+            InspectArgs(timeout=10, tokens=[], paths=[]),
+            AnalyzeArgs(analysis_url="https://test.example/api"),
+            PushArgs(
+                control_servers=[
+                    ControlServer(url="https://server1.com", headers={"x-client-id": "old-key"}, identifier="old-id")
+                ],
+                version="0.6.0",
+            ),
+        )
+
+    assert analyze.await_args.kwargs["push_key"] is None
+
+
+@pytest.mark.asyncio
+async def test_skip_pushing_true_when_push_key_set_without_control_servers():
+    """--push-key alone (no --control-server) must still suppress the
+    default push behavior via X-Push: skip, matching the header-derived
+    push-key flow where control_servers was always non-empty."""
+    inspected_paths = [InspectedPath(client="cursor", path="/config")]
+    response = ScanResponse(scan_path_responses=[ScanPathResponse(client="cursor", path="/config")])
+
+    with (
+        patch(
+            "agent_scan.pipelines.inspect_pipeline",
+            new_callable=AsyncMock,
+            return_value=(inspected_paths, ["alice"]),
+        ),
+        patch("agent_scan.pipelines.analyze_machine", new_callable=AsyncMock, return_value=response) as analyze,
+    ):
+        await inspect_analyze_push_pipeline(
+            InspectArgs(timeout=10, tokens=[], paths=[]),
+            AnalyzeArgs(analysis_url="https://test.example/api"),
+            PushArgs(control_servers=[], push_key="direct-push-key", version="0.6.0"),
+        )
+
+    assert analyze.await_args.kwargs["skip_pushing"] is True
+
+
+@pytest.mark.asyncio
+async def test_skip_pushing_false_when_neither_control_servers_nor_push_key_set():
+    """A plain scan with no control servers and no push key must not set
+    X-Push: skip."""
+    inspected_paths = [InspectedPath(client="cursor", path="/config")]
+    response = ScanResponse(scan_path_responses=[ScanPathResponse(client="cursor", path="/config")])
+
+    with (
+        patch(
+            "agent_scan.pipelines.inspect_pipeline",
+            new_callable=AsyncMock,
+            return_value=(inspected_paths, ["alice"]),
+        ),
+        patch("agent_scan.pipelines.analyze_machine", new_callable=AsyncMock, return_value=response) as analyze,
+    ):
+        await inspect_analyze_push_pipeline(
+            InspectArgs(timeout=10, tokens=[], paths=[]),
+            AnalyzeArgs(analysis_url="https://test.example/api"),
+            PushArgs(control_servers=[], version="0.6.0"),
+        )
+
+    assert analyze.await_args.kwargs["skip_pushing"] is False
