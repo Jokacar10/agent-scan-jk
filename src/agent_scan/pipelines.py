@@ -212,7 +212,7 @@ async def inspect_analyze_push_pipeline(
         identifier=analyze_args.identifier,
         additional_headers=analyze_args.additional_headers,
         verbose=verbose,
-        skip_pushing=bool(push_args.control_servers) or (push_args.push_key is not None),
+        skip_pushing=bool(push_args.control_servers) or bool(push_args.push_key),
         push_key=push_args.push_key,
         max_retries=analyze_args.max_retries,
         skip_ssl_verify=analyze_args.skip_ssl_verify,
