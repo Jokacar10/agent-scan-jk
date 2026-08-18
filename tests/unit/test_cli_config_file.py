@@ -7,6 +7,8 @@ import pytest
 
 from agent_scan.cli import (
     _coerce_config_value,
+    _effective_identifier,
+    _effective_push_key,
     apply_config_file,
     control_servers_from_config,
     explicitly_provided_dests,
@@ -466,3 +468,91 @@ class TestApplyConfigFilePushKeyAndMachineId:
         parser, args = _parse(argv)
         apply_config_file(parser, args, argv)
         assert args.push_key == ""
+
+
+class TestConfigFilePushKeyPrecedenceOverLegacyFlags:
+    """Unlike most flags, --push-key / --machine-id resolve against the
+    *deprecated* --control-server-H / --control-identifier flags, not
+    against their own CLI spelling (see cli._effective_push_key /
+    _effective_identifier). This means the usual "CLI beats config file"
+    rule does not hold across that old/new pair: a config-file push_key /
+    machine_id wins even when the legacy flags are passed explicitly on the
+    command line, because only an *explicit* --push-key / --machine-id (not
+    the legacy flags) counts as an override.
+    """
+
+    def test_config_push_key_wins_over_legacy_cli_flags(self, tmp_path):
+        path = _write_yaml(tmp_path, "push_key: config-push-key\n")
+        argv = [
+            "scan",
+            "--config-file",
+            path,
+            "--control-server",
+            "https://cli-server.com",
+            "--control-server-H",
+            "x-client-id: legacy-cli-key",
+            "--control-identifier",
+            "cli-user",
+        ]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.push_key == "config-push-key"
+        assert _effective_push_key(args) == "config-push-key"
+
+    def test_config_machine_id_wins_over_legacy_cli_flag(self, tmp_path):
+        path = _write_yaml(tmp_path, "machine_id: config-machine-id\n")
+        argv = [
+            "scan",
+            "--config-file",
+            path,
+            "--control-server",
+            "https://cli-server.com",
+            "--control-identifier",
+            "cli-user",
+        ]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.machine_id == "config-machine-id"
+        assert _effective_identifier(args) == "config-machine-id"
+
+    def test_explicit_cli_push_key_still_wins_over_legacy_flags_and_config(self, tmp_path):
+        # An *explicit* --push-key on the CLI is the one thing that legitimately
+        # overrides both the config file and the legacy flags.
+        path = _write_yaml(tmp_path, "push_key: config-push-key\n")
+        argv = [
+            "scan",
+            "--config-file",
+            path,
+            "--control-server",
+            "https://cli-server.com",
+            "--control-server-H",
+            "x-client-id: legacy-cli-key",
+            "--control-identifier",
+            "cli-user",
+            "--push-key",
+            "explicit-cli-push-key",
+        ]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.push_key == "explicit-cli-push-key"
+        assert _effective_push_key(args) == "explicit-cli-push-key"
+
+    def test_no_config_push_key_still_falls_back_to_legacy_cli_header(self, tmp_path):
+        # Sanity check: without a config-file push_key, legacy CLI flags
+        # still work as before.
+        path = _write_yaml(tmp_path, "server_timeout: 30\n")
+        argv = [
+            "scan",
+            "--config-file",
+            path,
+            "--control-server",
+            "https://cli-server.com",
+            "--control-server-H",
+            "x-client-id: legacy-cli-key",
+            "--control-identifier",
+            "cli-user",
+        ]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.push_key is None
+        assert _effective_push_key(args) == " legacy-cli-key"
