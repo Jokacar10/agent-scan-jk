@@ -142,3 +142,28 @@ async def test_skip_pushing_false_when_neither_control_servers_nor_push_key_set(
         )
 
     assert analyze.await_args.kwargs["skip_pushing"] is False
+
+
+@pytest.mark.asyncio
+async def test_skip_pushing_true_when_push_key_explicitly_empty_string():
+    """An explicit empty-string --push-key (used to override a legacy header,
+    see cli._effective_push_key's ``is not None`` semantics) must still be
+    treated as "a push key was set" for skip_pushing, not as falsy/unset."""
+    inspected_paths = [InspectedPath(client="cursor", path="/config")]
+    response = ScanResponse(scan_path_responses=[ScanPathResponse(client="cursor", path="/config")])
+
+    with (
+        patch(
+            "agent_scan.pipelines.inspect_pipeline",
+            new_callable=AsyncMock,
+            return_value=(inspected_paths, ["alice"]),
+        ),
+        patch("agent_scan.pipelines.analyze_machine", new_callable=AsyncMock, return_value=response) as analyze,
+    ):
+        await inspect_analyze_push_pipeline(
+            InspectArgs(timeout=10, tokens=[], paths=[]),
+            AnalyzeArgs(analysis_url="https://test.example/api"),
+            PushArgs(control_servers=[], push_key="", version="0.6.0"),
+        )
+
+    assert analyze.await_args.kwargs["skip_pushing"] is True
