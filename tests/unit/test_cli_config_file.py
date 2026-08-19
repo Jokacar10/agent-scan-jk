@@ -229,6 +229,17 @@ class TestApplyConfigFileScalars:
         assert args.server_timeout == 15
         assert "not_a_real_flag" in capsys.readouterr().err
 
+    def test_null_yaml_value_keeps_code_default_not_stringified(self, tmp_path):
+        # A key with no value (``analysis_url:``) parses as YAML null. It must
+        # be treated like the key was omitted (code default kept), not run
+        # through str() into the literal string "None".
+        path = _write_yaml(tmp_path, "analysis_url:\nserver_timeout: 15\n")
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.analysis_url == "https://api.snyk.io/hidden/mcp-scan/analysis-machine?version=2026-07-10"
+        assert args.server_timeout == 15
+
 
 class TestApplyConfigFileControlServers:
     _YAML = (
@@ -247,6 +258,17 @@ class TestApplyConfigFileControlServers:
         assert args.control_servers == [
             ControlServer(url="https://yaml-server.com", headers={"Auth": "yaml-token"}, identifier="yaml-user")
         ]
+
+    def test_null_control_servers_key_is_ignored(self, tmp_path):
+        # ``control_servers:`` with no value parses as YAML null; it must be
+        # treated like the key was omitted rather than raising a "must be a
+        # list" error.
+        path = _write_yaml(tmp_path, "control_servers:\nserver_timeout: 15\n")
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.control_servers == []
+        assert args.server_timeout == 15
 
     def test_cli_control_server_replaces_yaml_completely(self, tmp_path):
         # Passing any control-server block flag wipes the YAML array entirely.
@@ -468,6 +490,19 @@ class TestApplyConfigFilePushKeyAndMachineId:
         parser, args = _parse(argv)
         apply_config_file(parser, args, argv)
         assert args.push_key == ""
+
+    def test_null_push_key_and_machine_id_kept_as_none_not_stringified(self, tmp_path):
+        # A key written with no value (``push_key:``) parses as YAML null
+        # (Python None). It must be treated like the key was never in the
+        # file -- keeping the code default of None -- rather than being run
+        # through the str() type converter, which would otherwise produce
+        # the literal string "None".
+        path = _write_yaml(tmp_path, "push_key:\nmachine_id:\n")
+        argv = ["scan", "--config-file", path]
+        parser, args = _parse(argv)
+        apply_config_file(parser, args, argv)
+        assert args.push_key is None
+        assert args.machine_id is None
 
 
 class TestConfigFilePushKeyPrecedenceOverLegacyFlags:

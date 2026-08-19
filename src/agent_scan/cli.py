@@ -426,7 +426,7 @@ def apply_config_file(parser: argparse.ArgumentParser, args: argparse.Namespace,
 
     # control_servers is assembled outside argparse (see parse_control_servers),
     # so it is handled here with complete-replacement semantics.
-    if "control_servers" in config and not any(dest in explicit for dest in _CONTROL_SERVER_DESTS):
+    if config.get("control_servers") is not None and not any(dest in explicit for dest in _CONTROL_SERVER_DESTS):
         args.control_servers = control_servers_from_config(config["control_servers"])
 
     # For every remaining key the rule is uniform: an explicit CLI flag wins,
@@ -451,6 +451,13 @@ def apply_config_file(parser: argparse.ArgumentParser, args: argparse.Namespace,
             continue
         if key in explicit:
             continue  # explicit CLI flag wins over the config file (whole value)
+        if value is None:
+            # A key written with no value (``push_key:``) parses as YAML/Python
+            # ``None``. Treat that the same as the key being absent entirely
+            # (keep the code default / CLI-derived value) rather than running
+            # it through the type converter, which would otherwise stringify
+            # it into the literal text "None".
+            continue
         # Validate/convert exactly as argparse would for the equivalent CLI flag
         # (type converters, choices, scalar-vs-list shape) before assigning.
         setattr(args, key, _coerce_config_value(dest_to_action[key], raw_key, value))
