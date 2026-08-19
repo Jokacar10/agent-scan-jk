@@ -665,6 +665,9 @@ class TestAnalyzeMachineAuthPrecedence:
             patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_session_class,
             patch("agent_scan.verify_api.get_username", return_value="local-user"),
             patch("agent_scan.verify_api.get_hostname", return_value="test-host"),
+            # These tests pin sync-path auth/URL precedence; force the sync path so the
+            # config gate's own network call is not exercised here.
+            patch("agent_scan.verify_api._async_analysis_enabled", new_callable=AsyncMock, return_value=False),
             patch.dict(os.environ, env, clear=False),
         ):
             mock_session_class.return_value = self._make_mock_session()
@@ -884,6 +887,30 @@ def _make_get_session(*, status, json_data=None, get_exc=None):
     return mock_session
 
 
+def _get_cm(*, status=None, json_data=None, exc=None):
+    """A single ``session.get(...)`` async context manager yielding a status/json or raising."""
+    cm = MagicMock()
+    if exc is not None:
+        cm.__aenter__ = AsyncMock(side_effect=exc)
+    else:
+        response = AsyncMock()
+        response.status = status
+        response.json = AsyncMock(return_value=json_data)
+        cm.__aenter__ = AsyncMock(return_value=response)
+    cm.__aexit__ = AsyncMock(return_value=None)
+    return cm
+
+
+def _make_get_session_seq(get_cms):
+    """A mock ClientSession whose successive ``.get(...)`` calls return the given
+    context managers in order (one per retry attempt)."""
+    mock_session = MagicMock()
+    mock_session.get = MagicMock(side_effect=list(get_cms))
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    return mock_session
+
+
 def _make_post_session(*, status=202, post_exc=None):
     """A mock ClientSession whose ``.post(...)`` yields a response with the given status."""
     mock_session = MagicMock()
@@ -898,6 +925,29 @@ def _make_post_session(*, status=202, post_exc=None):
     mock_post.__aexit__ = AsyncMock(return_value=None)
 
     mock_session.post = MagicMock(return_value=mock_post)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    return mock_session
+
+
+def _post_cm(*, status=None, exc=None):
+    """A single ``session.post(...)`` async context manager yielding a status or raising."""
+    cm = MagicMock()
+    if exc is not None:
+        cm.__aenter__ = AsyncMock(side_effect=exc)
+    else:
+        response = AsyncMock()
+        response.status = status
+        cm.__aenter__ = AsyncMock(return_value=response)
+    cm.__aexit__ = AsyncMock(return_value=None)
+    return cm
+
+
+def _make_post_session_seq(post_cms):
+    """A mock ClientSession whose successive ``.post(...)`` calls return the given
+    context managers in order (one per retry attempt)."""
+    mock_session = MagicMock()
+    mock_session.post = MagicMock(side_effect=list(post_cms))
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=None)
     return mock_session
@@ -954,24 +1004,102 @@ class TestAsyncAnalysisEnabled:
         assert session.get.call_args[1]["headers"]["X-Push-Key"] == "push-abc"
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("status", [401, 404, 500, 503])
-    async def test_non_200_returns_false(self, status):
-        with patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls:
-            mock_cls.return_value = _make_get_session(status=status, json_data={"async_analysis_enabled": True})
-            result = await _async_analysis_enabled(self._CONFIG_URL, "push-abc", None, False)
-        assert result is False
+    @pytest.mark.parametrize("status", [400, 401, 403, 404])
+    async def test_4xx_returns_false_without_retry(self, status):
+        """Deterministic client errors fall back to sync immediately, no retry."""
+        with (
+            patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls,
+            patch("agent_scan.verify_api.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            session = _make_get_session(status=status, json_data={"async_analysis_enabled": True})
+            mock_cls.return_value = session
+            assert await _async_analysis_enabled(self._CONFIG_URL, "push-abc", None, False) is False
+
+        session.get.assert_called_once()
+        mock_sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [500, 502, 503])
+    async def test_5xx_retries_then_returns_false(self, status):
+        """A persistent 5xx is retried (default max_retries=2) then falls back to sync."""
+        with (
+            patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls,
+            patch("agent_scan.verify_api.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            session = _make_get_session(status=status, json_data={"async_analysis_enabled": True})
+            mock_cls.return_value = session
+            assert await _async_analysis_enabled(self._CONFIG_URL, "push-abc", None, False) is False
+
+        assert session.get.call_count == 2
+        mock_sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_5xx_retries_then_succeeds(self):
+        """A transient 5xx followed by a 200 honors the tenant's async preference."""
+        with (
+            patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls,
+            patch("agent_scan.verify_api.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            session = _make_get_session_seq(
+                [_get_cm(status=503), _get_cm(status=200, json_data={"async_analysis_enabled": True})]
+            )
+            mock_cls.return_value = session
+            assert await _async_analysis_enabled(self._CONFIG_URL, "push-abc", None, False) is True
+
+        assert session.get.call_count == 2
+        mock_sleep.assert_awaited_once()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "exc",
-        [aiohttp.ClientError("boom"), TimeoutError("slow")],
-        ids=["client_error", "timeout"],
+        [
+            aiohttp.ServerDisconnectedError("dropped"),
+            aiohttp.ClientOSError("connection reset"),
+            aiohttp.ClientPayloadError("truncated"),
+            TimeoutError("slow"),
+        ],
+        ids=["server_disconnected", "os_error", "payload_error", "timeout"],
     )
-    async def test_network_error_returns_false(self, exc):
-        with patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls:
-            mock_cls.return_value = _make_get_session(status=200, get_exc=exc)
-            result = await _async_analysis_enabled(self._CONFIG_URL, "push-abc", None, False)
-        assert result is False
+    async def test_transient_exception_retries_then_returns_false(self, exc):
+        with (
+            patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls,
+            patch("agent_scan.verify_api.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            session = _make_get_session(status=200, get_exc=exc)
+            mock_cls.return_value = session
+            assert await _async_analysis_enabled(self._CONFIG_URL, "push-abc", None, False) is False
+
+        assert session.get.call_count == 2
+        mock_sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_transient_exception_retries_then_succeeds(self):
+        with (
+            patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls,
+            patch("agent_scan.verify_api.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            session = _make_get_session_seq(
+                [_get_cm(exc=TimeoutError("slow")), _get_cm(status=200, json_data={"async_analysis_enabled": True})]
+            )
+            mock_cls.return_value = session
+            assert await _async_analysis_enabled(self._CONFIG_URL, "push-abc", None, False) is True
+
+        assert session.get.call_count == 2
+        mock_sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_non_transient_client_error_returns_false_without_retry(self):
+        """A bare aiohttp.ClientError outside the transient set falls back to sync, no retry."""
+        with (
+            patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls,
+            patch("agent_scan.verify_api.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            session = _make_get_session(status=200, get_exc=aiohttp.ClientError("boom"))
+            mock_cls.return_value = session
+            assert await _async_analysis_enabled(self._CONFIG_URL, "push-abc", None, False) is False
+
+        session.get.assert_called_once()
+        mock_sleep.assert_not_awaited()
 
 
 class TestSubmitAsyncAnalysis:
@@ -1018,29 +1146,117 @@ class TestSubmitAsyncAnalysis:
         assert "X-Scan-User-Id" not in session.post.call_args[1]["headers"]
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("status", [400, 500, 503])
-    async def test_non_202_does_not_raise(self, status):
+    @pytest.mark.parametrize("status", [400, 401, 403, 413])
+    async def test_4xx_does_not_retry(self, status):
+        """4xx is deterministic: return after a single attempt without retrying."""
         payload = MagicMock()
         payload.model_dump_json.return_value = "{}"
 
-        with patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls:
-            mock_cls.return_value = _make_post_session(status=status)
-            # Must return without raising (fire-and-forget).
+        with (
+            patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls,
+            patch("agent_scan.verify_api.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            session = _make_post_session(status=status)
+            mock_cls.return_value = session
             assert await _submit_async_analysis(self._ASYNC_URL, payload, {}, None, None, False) is None
+
+        session.post.assert_called_once()
+        mock_sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_202_first_try_does_not_retry(self):
+        payload = MagicMock()
+        payload.model_dump_json.return_value = "{}"
+
+        with (
+            patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls,
+            patch("agent_scan.verify_api.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            session = _make_post_session(status=202)
+            mock_cls.return_value = session
+            assert await _submit_async_analysis(self._ASYNC_URL, payload, {}, None, None, False) is None
+
+        session.post.assert_called_once()
+        mock_sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [500, 502, 503])
+    async def test_5xx_retries_then_succeeds(self, status):
+        """A 5xx is transient (server asks to retry later); the next 202 succeeds."""
+        payload = MagicMock()
+        payload.model_dump_json.return_value = "{}"
+
+        with (
+            patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls,
+            patch("agent_scan.verify_api.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            session = _make_post_session_seq([_post_cm(status=status), _post_cm(status=202)])
+            mock_cls.return_value = session
+            assert await _submit_async_analysis(self._ASYNC_URL, payload, {}, None, None, False, 3) is None
+
+        assert session.post.call_count == 2
+        mock_sleep.assert_awaited_once()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "exc",
-        [aiohttp.ClientError("boom"), TimeoutError("slow")],
-        ids=["client_error", "timeout"],
+        [
+            aiohttp.ServerDisconnectedError("dropped"),
+            aiohttp.ClientOSError("connection reset"),
+            aiohttp.ClientPayloadError("truncated"),
+            TimeoutError("slow"),
+        ],
+        ids=["server_disconnected", "os_error", "payload_error", "timeout"],
     )
-    async def test_network_error_does_not_raise(self, exc):
+    async def test_transient_exception_retries_then_succeeds(self, exc):
+        """The client-side manifestations of a server ClientDisconnect are retried."""
         payload = MagicMock()
         payload.model_dump_json.return_value = "{}"
 
-        with patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls:
-            mock_cls.return_value = _make_post_session(post_exc=exc)
-            assert await _submit_async_analysis(self._ASYNC_URL, payload, {}, None, None, False) is None
+        with (
+            patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls,
+            patch("agent_scan.verify_api.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            session = _make_post_session_seq([_post_cm(exc=exc), _post_cm(status=202)])
+            mock_cls.return_value = session
+            assert await _submit_async_analysis(self._ASYNC_URL, payload, {}, None, None, False, 3) is None
+
+        assert session.post.call_count == 2
+        mock_sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_transient_exception_gives_up_after_max_retries(self):
+        """Exhausting retries returns None (fire-and-forget) after max_retries attempts."""
+        payload = MagicMock()
+        payload.model_dump_json.return_value = "{}"
+
+        with (
+            patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls,
+            patch("agent_scan.verify_api.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            session = _make_post_session(post_exc=TimeoutError("slow"))
+            mock_cls.return_value = session
+            assert await _submit_async_analysis(self._ASYNC_URL, payload, {}, None, None, False, 3) is None
+
+        assert session.post.call_count == 3
+        assert mock_sleep.await_count == 2  # backoff between the 3 attempts
+
+    @pytest.mark.asyncio
+    async def test_non_transient_client_error_does_not_retry(self):
+        """A bare aiohttp.ClientError outside the transient set is swallowed, not retried."""
+        payload = MagicMock()
+        payload.model_dump_json.return_value = "{}"
+
+        with (
+            patch("agent_scan.verify_api.aiohttp.ClientSession") as mock_cls,
+            patch("agent_scan.verify_api.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            session = _make_post_session(post_exc=aiohttp.ClientError("boom"))
+            mock_cls.return_value = session
+            assert await _submit_async_analysis(self._ASYNC_URL, payload, {}, None, None, False, 3) is None
+
+        session.post.assert_called_once()
+        mock_sleep.assert_not_awaited()
 
 
 class TestAnalyzeMachineAsyncRouting:

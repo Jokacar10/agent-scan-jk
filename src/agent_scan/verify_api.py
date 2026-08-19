@@ -4,6 +4,7 @@ import gzip
 import logging
 import os
 import ssl
+import sys
 import traceback
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -84,34 +85,73 @@ def _force_analysis_api_version(analysis_url: str) -> str:
     return urlunsplit(parsed._replace(query=urlencode(query)))
 
 
+_RETRYABLE_TRANSPORT_EXCEPTIONS = (
+    TimeoutError,
+    aiohttp.ClientConnectionError,
+    aiohttp.ClientPayloadError,
+)
+
+_CONFIG_REQUEST_TIMEOUT = 5
+
+
+def _warn_async_results_not_shown() -> None:
+    """Notify push-key users that async scans return no local results and how to opt into them."""
+    rich.print(
+        "[yellow]Warning: This scan was submitted for asynchronous analysis, so results are processed on the "
+        "Snyk side and will not be shown here. Re-run with --show-analysis-results to run the analysis "
+        "synchronously and display results locally.[/yellow]",
+        file=sys.stderr,
+    )
+
+
 async def _async_analysis_enabled(
     config_url: str,
     push_key: str,
     trace_configs: list | None,
     skip_ssl_verify: bool,
+    max_retries: int = 2,
 ) -> bool:
     """Ask the backend whether this push-key's tenant routes to async analysis.
 
-    Returns False on any error or non-200 response so the caller uses the
-    synchronous path.
+    Returns False on any error, non-2xx, or after exhausting retries so the caller
+    falls back to the synchronous path. Transient failures (5xx, connection issues,
+    timeouts) are retried with a short timeout and exponential backoff; deterministic
+    4xx responses are not retried.
     """
-    try:
-        async with _analysis_client_session(trace_configs, skip_ssl_verify) as session:
-            async with session.get(
-                config_url,
-                headers={"X-Push-Key": push_key},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as response:
-                if response.status != 200:
+    for attempt in range(max_retries):
+        try:
+            async with _analysis_client_session(trace_configs, skip_ssl_verify) as session:
+                async with session.get(
+                    config_url,
+                    headers={"X-Push-Key": push_key},
+                    timeout=aiohttp.ClientTimeout(total=_CONFIG_REQUEST_TIMEOUT),
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return bool(data.get("async_analysis_enabled", False))
+                    if response.status < 500:
+                        logger.warning(
+                            "Agent Scan config request returned %s; using synchronous analysis.", response.status
+                        )
+                        return False
                     logger.warning(
-                        "Agent Scan config request returned %s; using synchronous analysis.", response.status
+                        "Agent Scan config request returned %s (attempt %d/%d).",
+                        response.status,
+                        attempt + 1,
+                        max_retries,
                     )
-                    return False
-                data = await response.json()
-                return bool(data.get("async_analysis_enabled", False))
-    except (TimeoutError, aiohttp.ClientError) as e:
-        logger.warning("Agent Scan config request failed (%s); using synchronous analysis.", e)
-        return False
+        except _RETRYABLE_TRANSPORT_EXCEPTIONS as e:
+            logger.warning("Agent Scan config request failed (attempt %d/%d): %s", attempt + 1, max_retries, e)
+        except aiohttp.ClientError as e:
+            # Non-transient transport error (e.g. malformed URL): retrying will not help.
+            logger.warning("Agent Scan config request failed (%s); using synchronous analysis.", e)
+            return False
+
+        if attempt < max_retries - 1:
+            await asyncio.sleep(2**attempt)  # 1s, 2s, ...
+
+    logger.warning("Agent Scan config request failed after %d attempt(s); using synchronous analysis.", max_retries)
+    return False
 
 
 async def _submit_async_analysis(
@@ -121,8 +161,14 @@ async def _submit_async_analysis(
     identifier: str | None,
     trace_configs: list | None,
     skip_ssl_verify: bool,
+    max_retries: int = 3,
 ) -> None:
-    """Stream the gzipped payload to the async accept endpoint"""
+    """Stream the gzipped payload to the async accept endpoint.
+
+    Fire-and-forget: never raises. Retries transient transport failures and 5xx
+    responses with exponential backoff, mirroring the synchronous path. 4xx
+    responses are deterministic and are not retried.
+    """
     body = gzip.compress(payload.model_dump_json().encode("utf-8"))
     headers = {
         **base_headers,
@@ -131,20 +177,47 @@ async def _submit_async_analysis(
     }
     if identifier:
         headers["X-Scan-User-Id"] = identifier
-    try:
-        async with _analysis_client_session(trace_configs, skip_ssl_verify) as session:
-            async with session.post(
-                async_url,
-                data=body,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=75),
-            ) as response:
-                if response.status == 202:
-                    logger.info("Scan accepted for asynchronous analysis.")
-                else:
-                    logger.warning("Async analysis returned status %s.", response.status)
-    except (TimeoutError, aiohttp.ClientError) as e:
-        logger.warning("Async analysis request failed: %s", e)
+
+    for attempt in range(max_retries):
+        try:
+            async with _analysis_client_session(trace_configs, skip_ssl_verify) as session:
+                async with session.post(
+                    async_url,
+                    data=body,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=75),
+                ) as response:
+                    if response.status == 202:
+                        logger.info("Scan accepted for asynchronous analysis.")
+                        return
+                    if response.status < 500:
+                        # Deterministic client error (e.g. 400/413/401/403): retrying
+                        # the same body cannot succeed, so give up immediately.
+                        logger.error("Async analysis returned status %s; not retrying.", response.status)
+                        return
+                    logger.warning(
+                        "Async analysis returned status %s (attempt %d/%d).",
+                        response.status,
+                        attempt + 1,
+                        max_retries,
+                    )
+        except _RETRYABLE_TRANSPORT_EXCEPTIONS as e:
+            logger.warning(
+                "Async analysis request failed (attempt %d/%d): %s",
+                attempt + 1,
+                max_retries,
+                e,
+            )
+        except aiohttp.ClientError as e:
+            # Non-transient transport error (e.g. malformed URL): retrying will not help.
+            logger.error("Async analysis request failed: %s", e)
+            return
+
+        if attempt < max_retries - 1:
+            backoff_time = 2**attempt  # 1s, 2s, 4s
+            await asyncio.sleep(backoff_time)
+
+    logger.error("Async analysis submission failed after %d attempt(s).", max_retries)
 
 
 def _entity_summary(entity: Entity) -> McpEntitySummary:
@@ -422,7 +495,10 @@ async def analyze_machine(
             config_url = analysis_url.replace(_SYNC_ANALYSIS_PATH, _AGENT_SCAN_CONFIG_PATH)
             if await _async_analysis_enabled(config_url, push_key, trace_configs, skip_ssl_verify):
                 async_url = analysis_url.replace(_SYNC_ANALYSIS_PATH, _ASYNC_ANALYSIS_PATH)
-                await _submit_async_analysis(async_url, payload, headers, identifier, trace_configs, skip_ssl_verify)
+                await _submit_async_analysis(
+                    async_url, payload, headers, identifier, trace_configs, skip_ssl_verify, max_retries
+                )
+                _warn_async_results_not_shown()
                 return _accepted_async_response(payload)
     elif snyk_token:
         # CLI mode with SNYK_TOKEN environment variable for authentication
