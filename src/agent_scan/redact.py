@@ -9,6 +9,7 @@ This module provides functions to redact sensitive data like:
 - File paths in tracebacks
 """
 
+import functools
 import logging
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -204,6 +205,24 @@ def _wrap_for_entropy(value: str) -> str:
 # fewer tokens, never one a plugin would flag.
 _PROSE_MAX_LEN = 15
 
+# Line-level fast-path gate for :func:`_redact_secrets_in_line`. A line needs the
+# full (expensive) plugin scan iff it can contain a value any plugin could flag.
+# This is the line-level lift of :func:`_could_be_secret`, expressed as one
+# ``re.search`` so a prose/markdown line is rejected in a single linear pass
+# instead of ``str.split()`` + the per-token plugin battery on every word:
+#   * ``[^a-z \t]`` — any digit, uppercase, quote, ``=``/``:``, punctuation, or
+#     non-ASCII char. Every format detector needs one of these, and the entropy
+#     plugins only match quoted literals (which require a quote char). A line of
+#     lowercase words + spaces/tabs satisfies none of them.
+#   * ``[a-z]{16,}`` — a run of >``_PROSE_MAX_LEN`` lowercase letters. Lowercase
+#     is valid base64 (log2(26) ~= 4.7 > Base64HighEntropyString's 4.5 limit), so
+#     a long lowercase-only token could still be flagged and must not be skipped.
+#     The bound must stay ``_PROSE_MAX_LEN + 1``.
+# If neither branch matches, EVERY token is a short lowercase-ASCII word that
+# ``_could_be_secret`` would already reject, so skipping the line is provably
+# safe for the current plugin set.
+_LINE_NEEDS_SCAN = re.compile(r"[^a-z \t]|[a-z]{" + str(_PROSE_MAX_LEN + 1) + r",}")
+
 
 def _could_be_secret(value: str) -> bool:
     """Cheap O(len) pre-filter: ``True`` for every value any plugin could flag,
@@ -282,6 +301,18 @@ def _detect_secret(value: str, plugins: list | None = None) -> str | None:
         return _detect_secret_in_plugins(value, plugins)
     with transient_settings(_DETECT_SECRETS_CONFIG):
         return _detect_secret_in_plugins(value, list(get_plugins()))
+
+
+@functools.lru_cache(maxsize=200_000)
+def _detect_secret_cached(value: str) -> str | None:
+    """Cache _detect_secret_in_plugins results by token value.
+
+    Skill text repeats the same tokens (prose words, punctuation, keywords)
+    thousands of times per run. Detection depends only on the token and the
+    fixed plugin set (_get_cached_plugins), so the result is the same
+    every time caching by value skips the repeated work without changing output.
+    """
+    return _detect_secret_in_plugins(value, _get_cached_plugins())
 
 
 def _detect_keyword(prev_normalized: str, curr_raw: str) -> str | None:
@@ -542,6 +573,11 @@ def _redact_secrets_in_line(line: str, plugins: list) -> str:
     Replacements are applied longest-first so a secret that is a substring of
     another does not corrupt the marker inserted for the longer one.
     """
+    # Fast-path gate: skip the whole plugin battery for lines that provably hold
+    # no secret (pure lowercase-ASCII prose). See :data:`_LINE_NEEDS_SCAN`.
+    if not _LINE_NEEDS_SCAN.search(line):
+        return line
+
     replacements: dict[str, str] = {}
 
     # Pass 1: high-entropy detectors on the raw line (catches quoted literals).
@@ -566,7 +602,7 @@ def _redact_secrets_in_line(line: str, plugins: list) -> str:
             if candidate in replacements:
                 handled = True
                 break
-            plugin_name = _detect_secret(candidate, plugins)
+            plugin_name = _detect_secret_cached(candidate)
             if plugin_name is not None:
                 replacements[candidate] = _redaction_marker(plugin_name)
                 handled = True
@@ -581,7 +617,7 @@ def _redact_secrets_in_line(line: str, plugins: list) -> str:
         for segment in _TOKEN_SPLIT_DELIMS.split(token):
             if not segment or segment in replacements:
                 continue
-            plugin_name = _detect_secret(segment, plugins)
+            plugin_name = _detect_secret_cached(segment)
             if plugin_name is not None:
                 replacements[segment] = _redaction_marker(plugin_name)
 

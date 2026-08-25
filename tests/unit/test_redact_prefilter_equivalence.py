@@ -92,6 +92,47 @@ def test_prefilter_output_identical_to_unfiltered(seed, monkeypatch):
     assert gated == ungated
 
 
+class _AlwaysMatch:
+    """Stand-in for ``_LINE_NEEDS_SCAN`` that forces every line through the full scan."""
+
+    @staticmethod
+    def search(_line):
+        return True
+
+
+@pytest.mark.parametrize("seed", [1, 7, 42, 20260618, 999999])
+def test_line_gate_output_identical_to_unfiltered(seed, monkeypatch):
+    """The line-level gate (_LINE_NEEDS_SCAN) must skip only lines the full scan
+    would leave unchanged: gate-on output == gate-off output, byte-for-byte."""
+    rng = random.Random(seed)
+    tokens = _build_tokens(rng, 4000)
+    lines, i = [], 0
+    while i < len(tokens):
+        width = rng.randint(1, 12)
+        lines.append(" ".join(tokens[i : i + width]))
+        i += width
+    text = "\n".join(lines)
+
+    gated = redact_text(text)  # real _LINE_NEEDS_SCAN
+
+    monkeypatch.setattr(redact_mod, "_LINE_NEEDS_SCAN", _AlwaysMatch)  # disable line gate
+    ungated = redact_text(text)
+
+    assert gated == ungated
+
+
+def test_line_gate_selects_every_known_secret():
+    """No line carrying a known-format secret may be skipped by the gate."""
+    for secret in _KNOWN_FORMAT:
+        for line in (secret, f"key = {secret}", f"`{secret}`", f"see url/{secret}?x=1"):
+            assert redact_mod._LINE_NEEDS_SCAN.search(line) is not None, line
+    # A long pure-lowercase run (valid base64, entropy can exceed the 4.5 limit)
+    # must still be selected via the second alternative.
+    assert redact_mod._LINE_NEEDS_SCAN.search("a" * (redact_mod._PROSE_MAX_LEN + 1)) is not None
+    # Pure short lowercase prose is the only thing allowed to be skipped.
+    assert redact_mod._LINE_NEEDS_SCAN.search("this skill deploys your app") is None
+
+
 def test_prefilter_skips_only_safe_tokens():
     """Spot-check the gate's contract on boundary cases."""
     # skipped (pure lowercase, <=22)
