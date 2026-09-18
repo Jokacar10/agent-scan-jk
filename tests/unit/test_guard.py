@@ -5132,6 +5132,64 @@ class TestServersDiscoveredPayload:
         ]
         assert result[1]["servers"] == []
 
+    def test_registry_sourced_server_reaches_discovery_payload(self, tmp_path):
+        plugin = tmp_path / "external" / "jira"
+        plugin.mkdir(parents=True)
+        config = plugin / ".mcp.json"
+        config.write_text('{"jira": {"command": "jira-mcp"}}')
+        (tmp_path / ".claude").mkdir()
+        registry = tmp_path / ".claude" / "plugins" / "installed_plugins.json"
+        registry.parent.mkdir(parents=True)
+        registry.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "plugins": {"jira@prodsec": [{"installPath": plugin.as_posix()}]},
+                }
+            )
+        )
+
+        with (
+            patch("agent_scan.pipelines.get_readable_home_directories", return_value=[(tmp_path, "tester")]),
+            patch("agent_scan.pipelines.get_well_known_clients", return_value=[]),
+        ):
+            result = guard_module._discover_servers_payload()
+
+        claude = next(entry for entry in result if entry["client"] == "claude code")
+        assert [(server["name"], server["config_path"]) for server in claude["servers"]] == [
+            ("jira", config.as_posix())
+        ]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink semantics")
+    def test_symlinked_registry_plugin_server_reaches_payload_once(self, tmp_path):
+        from agent_scan.well_known_clients import get_well_known_clients
+
+        real = tmp_path / "source" / "plugin"
+        manifest = real / ".claude-plugin" / "plugin.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text('{"name": "linked"}')
+        config = real / ".mcp.json"
+        config.write_text('{"linked": {"command": "mcp"}}')
+        cache = tmp_path / ".claude" / "plugins" / "cache" / "mp"
+        cache.mkdir(parents=True)
+        linked = cache / "plugin"
+        linked.symlink_to(real, target_is_directory=True)
+        registry = tmp_path / ".claude" / "plugins" / "installed_plugins.json"
+        registry.write_text(json.dumps({"version": 2, "plugins": {"linked@mp": [{"installPath": linked.as_posix()}]}}))
+        claude_clients = [client for client in get_well_known_clients() if client.name == "claude code"]
+
+        with (
+            patch("agent_scan.pipelines.get_readable_home_directories", return_value=[(tmp_path, "tester")]),
+            patch("agent_scan.pipelines.get_well_known_clients", return_value=claude_clients),
+        ):
+            result = guard_module._discover_servers_payload()
+
+        claude = next(entry for entry in result if entry["client"] == "claude code")
+        linked_servers = [server for server in claude["servers"] if server["name"] == "linked"]
+        assert [(server["name"], server["config_path"]) for server in linked_servers] == [
+            ("linked", config.resolve().as_posix())
+        ]
+
     def test_reports_config_discovery_errors(self):
         client = self._client(
             mcp_configs={
