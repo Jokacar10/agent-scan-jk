@@ -289,3 +289,92 @@ class TestResolveCommandAndArgsRegression:
         assert args == []
         assert command == str(script)
         assert params.args == []
+
+
+@pytest.mark.asyncio
+async def test_stdio_client_uses_discoverer_resolved_runtime_context():
+    client_cm = AsyncMock()
+    client_cm.__aenter__.return_value = (AsyncMock(), AsyncMock())
+    configured_command = "./Codex Computer Use.app/Contents/MacOS/server"
+    server = StdioServer(command="placeholder", args=["mcp"])
+    server.command = configured_command
+    server.set_runtime_context(
+        "/Users/test/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/server",
+        "/Users/test/.codex/computer-use",
+    )
+
+    with patch("agent_scan.mcp_client.stdio_client", return_value=client_cm) as make_stdio_client:
+        async with get_client(server):
+            pass
+
+    params = make_stdio_client.call_args.args[0]
+    assert params.command == server.runtime_command
+    assert params.args == ["mcp"]
+    assert params.cwd == server.runtime_cwd
+    dumped = server.model_dump(mode="json")
+    assert dumped["command"] == configured_command
+    assert "runtime_command" not in dumped
+    assert "runtime_cwd" not in dumped
+
+
+@pytest.mark.asyncio
+async def test_resolved_stdio_server_keeps_args_when_nested_in_client_to_inspect():
+    from agent_scan.models.inspect import ClientToInspect
+
+    client_cm = AsyncMock()
+    client_cm.__aenter__.return_value = (AsyncMock(), AsyncMock())
+    configured_command = "./Codex Computer Use.app/Contents/MacOS/server"
+    server = StdioServer(command="placeholder", args=["mcp"])
+    server.command = configured_command
+    server.set_runtime_context(
+        "/Users/test/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/server",
+        "/Users/test/.codex/computer-use",
+    )
+
+    client = ClientToInspect(
+        name="codex",
+        client_path="~/.codex",
+        mcp_configs={"~/.codex/config.toml": [("computer-use", server)]},
+        skills_dirs={},
+    )
+    nested = client.mcp_configs["~/.codex/config.toml"][0][1]
+    assert isinstance(nested, StdioServer)
+    assert nested.command == configured_command
+    assert nested.args == ["mcp"]
+
+    with patch("agent_scan.mcp_client.stdio_client", return_value=client_cm) as make_stdio_client:
+        async with get_client(nested):
+            pass
+
+    params = make_stdio_client.call_args.args[0]
+    assert params.command == server.runtime_command
+    assert params.args == ["mcp"]
+
+
+@pytest.mark.asyncio
+async def test_config_input_cannot_override_launched_command_or_cwd(tmp_path):
+    client_cm = AsyncMock()
+    client_cm.__aenter__.return_value = (AsyncMock(), AsyncMock())
+    declared = tmp_path / "declared-mcp"
+    declared.write_text("#!/bin/sh\nexit 0\n")
+    declared.chmod(0o755)
+    server = StdioServer.model_validate(
+        {
+            "command": str(declared),
+            "runtime_command": str(tmp_path / "different-mcp"),
+            "runtime_cwd": str(tmp_path),
+            "_runtime_command": str(tmp_path / "different-mcp"),
+            "_runtime_cwd": str(tmp_path),
+        }
+    )
+
+    assert server.runtime_command is None
+    assert server.runtime_cwd is None
+
+    with patch("agent_scan.mcp_client.stdio_client", return_value=client_cm) as make_stdio_client:
+        async with get_client(server):
+            pass
+
+    params = make_stdio_client.call_args.args[0]
+    assert params.command == str(declared)
+    assert params.cwd is None

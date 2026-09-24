@@ -3,7 +3,8 @@
 import json
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from subprocess import CompletedProcess
+from unittest.mock import AsyncMock, call, patch
 
 import pytest
 
@@ -7118,7 +7119,8 @@ def test_walk_manifest_candidates_finds_files_and_symlinked_named_dirs_in_one_wa
     with patch.object(base_module.os, "walk", wraps=real_walk) as walk:
         candidates = list(base_module._walk_manifest_candidates(base, "plugin.json", (".claude-plugin",), 10))
 
-    assert candidates == [ordinary, linked_dir / "plugin.json"]
+    # os.walk yields siblings in filesystem order, which is not stable across runners.
+    assert sorted(candidates) == sorted([ordinary, linked_dir / "plugin.json"])
     assert walk.call_count == 1
 
 
@@ -7760,6 +7762,148 @@ def test_codex_discoverer_extra_codex_keys_do_not_sink_validation(tmp_path):
     assert server.command == "npx"
 
 
+def test_codex_discoverer_resolves_all_managed_relative_binaries_for_signing_and_startup(tmp_path):
+    from agent_scan.agents import CodexDiscoverer
+
+    codex_home = tmp_path / ".codex"
+    computer_use_command = (
+        "./Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
+    )
+    computer_use_binary = codex_home / "computer-use" / computer_use_command
+    computer_use_binary.parent.mkdir(parents=True)
+    computer_use_binary.write_text("binary")
+    helper_command = "./bin/native-helper"
+    helper_binary = codex_home / "native-helper" / helper_command
+    helper_binary.parent.mkdir(parents=True)
+    helper_binary.write_text("binary")
+    (codex_home / "config.toml").write_text(
+        f'[mcp_servers.computer-use]\ncommand = "{computer_use_command}"\n'
+        'args = ["mcp"]\ncwd = "."\nenabled = false\n\n'
+        f'[mcp_servers.native-helper]\ncommand = "{helper_command}"\n'
+        'args = ["serve"]\ncwd = "."\nenabled = true\n'
+    )
+
+    def fake_codesign(args, **_kwargs):
+        if "--verify" in args:
+            return CompletedProcess(args=args, returncode=0)
+        identifier = Path(args[-1]).name
+        return CompletedProcess(
+            args=args,
+            returncode=0,
+            stderr="\n".join(
+                (
+                    f"Identifier={identifier}",
+                    "Authority=Developer ID Application: OpenAI, L.L.C.",
+                    "Authority=Apple Root CA",
+                )
+            ),
+        )
+
+    with (
+        patch("agent_scan.signed_binary.sys.platform", "darwin"),
+        patch("agent_scan.signed_binary.subprocess.run", side_effect=fake_codesign) as run,
+    ):
+        mcp_configs = CodexDiscoverer(tmp_path).discover_mcp_servers()
+
+    config_path = (codex_home / "config.toml").as_posix()
+    by_name = dict(mcp_configs[config_path])
+    computer_use = by_name["computer-use"]
+    helper = by_name["native-helper"]
+    assert isinstance(computer_use, StdioServer)
+    assert computer_use.command == computer_use_command
+    assert computer_use.args == ["mcp"]
+    assert computer_use.binary_identifier == "SkyComputerUseClient"
+    assert computer_use.runtime_command == str(computer_use_binary.resolve())
+    assert computer_use.runtime_cwd == str((codex_home / "computer-use").resolve())
+    assert isinstance(helper, StdioServer)
+    assert helper.command == helper_command
+    assert helper.args == ["serve"]
+    assert helper.binary_identifier == "native-helper"
+    assert helper.runtime_command == str(helper_binary.resolve())
+    assert helper.runtime_cwd == str((codex_home / "native-helper").resolve())
+    computer_use_path = str(computer_use_binary.resolve())
+    helper_path = str(helper_binary.resolve())
+    assert run.call_args_list == [
+        call(
+            ["codesign", "--verify", "--strict", "--verbose=3", computer_use_path],
+            capture_output=True,
+            text=True,
+            check=False,
+        ),
+        call(["codesign", "-dvvv", computer_use_path], capture_output=True, text=True, check=False),
+        call(
+            ["codesign", "--verify", "--strict", "--verbose=3", helper_path],
+            capture_output=True,
+            text=True,
+            check=False,
+        ),
+        call(["codesign", "-dvvv", helper_path], capture_output=True, text=True, check=False),
+    ]
+
+
+def test_codex_discoverer_does_not_guess_between_multiple_relative_binary_candidates(tmp_path):
+    from agent_scan.agents import CodexDiscoverer
+
+    codex_home = tmp_path / ".codex"
+    for root in (codex_home, codex_home / "ambiguous"):
+        binary = root / "bin" / "server"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text("binary")
+    (codex_home / "config.toml").write_text(
+        '[mcp_servers.ambiguous]\ncommand = "./bin/server"\nargs = ["serve"]\ncwd = "."\n'
+    )
+
+    with (
+        patch("agent_scan.signed_binary.sys.platform", "darwin"),
+        patch("agent_scan.signed_binary.subprocess.run") as run,
+    ):
+        mcp_configs = CodexDiscoverer(tmp_path).discover_mcp_servers()
+
+    config_path = (codex_home / "config.toml").as_posix()
+    _name, server = mcp_configs[config_path][0]
+    assert isinstance(server, StdioServer)
+    assert server.binary_identifier is None
+    assert server.runtime_command is None
+    assert server.runtime_cwd is None
+    run.assert_not_called()
+
+
+def test_codex_discoverer_ignores_config_supplied_runtime_context(tmp_path):
+    from agent_scan.agents import CodexDiscoverer
+
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    declared = tmp_path / "declared-mcp"
+    declared.write_text("binary")
+    different = tmp_path / "different-mcp"
+    different.write_text("binary")
+    (codex_home / "config.toml").write_text(
+        f'[mcp_servers.override]\ncommand = "{declared.as_posix()}"\nargs = ["serve"]\n'
+        f'runtime_command = "{different.as_posix()}"\nruntime_cwd = "{tmp_path.as_posix()}"\n'
+    )
+
+    with (
+        patch("agent_scan.signed_binary.sys.platform", "darwin"),
+        patch(
+            "agent_scan.signed_binary.subprocess.run",
+            return_value=CompletedProcess(args=[], returncode=1, stderr="not signed"),
+        ) as run,
+    ):
+        mcp_configs = CodexDiscoverer(tmp_path).discover_mcp_servers()
+
+    _name, server = mcp_configs[(codex_home / "config.toml").as_posix()][0]
+    assert isinstance(server, StdioServer)
+    assert server.command == declared.as_posix()
+    assert server.runtime_command is None
+    assert server.runtime_cwd is None
+    run.assert_called_once_with(
+        ["codesign", "--verify", "--strict", "--verbose=3", str(declared.resolve())],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def test_codex_discoverer_degrades_without_toml_support(tmp_path, monkeypatch):
     """With no TOML decoder available (Python < 3.11 and no ``tomli`` backport),
     Codex TOML discovery degrades to no servers rather than raising."""
@@ -8235,6 +8379,58 @@ def test_codex_discoverer_discovers_plugin_mcp_flat(tmp_path):
     name, server = mcp_configs[keys[0]][0]
     assert name == "docs"
     assert isinstance(server, StdioServer)
+
+
+def test_codex_discoverer_signs_relative_plugin_binary_from_plugin_root(tmp_path):
+    from agent_scan.agents import CodexDiscoverer
+
+    cache = tmp_path / ".codex" / "plugins" / "cache"
+    plugin_dir = _make_codex_plugin(cache, "mkt", "native-plugin", "1.0.0")
+    binary = plugin_dir / "bin" / "native-mcp"
+    binary.parent.mkdir()
+    binary.write_text("binary")
+    (plugin_dir / ".mcp.json").write_text(
+        '{"mcpServers": {"native": {"command": "./bin/native-mcp", "args": ["serve"], "cwd": "."}}}'
+    )
+    details = "\n".join(
+        (
+            "Identifier=native-mcp",
+            "Authority=Developer ID Application: Example",
+            "Authority=Apple Root CA",
+        )
+    )
+
+    with (
+        patch("agent_scan.signed_binary.sys.platform", "darwin"),
+        patch(
+            "agent_scan.signed_binary.subprocess.run",
+            side_effect=(
+                CompletedProcess(args=[], returncode=0),
+                CompletedProcess(args=[], returncode=0, stderr=details),
+            ),
+        ) as run,
+    ):
+        mcp_configs = CodexDiscoverer(tmp_path).discover_mcp_servers()
+
+    config_path = (plugin_dir / ".mcp.json").as_posix()
+    name, server = mcp_configs[config_path][0]
+    assert name == "native"
+    assert isinstance(server, StdioServer)
+    assert server.command == "./bin/native-mcp"
+    assert server.args == ["serve"]
+    assert server.binary_identifier == "native-mcp"
+    assert server.runtime_command == str(binary.resolve())
+    assert server.runtime_cwd == str(plugin_dir.resolve())
+    binary_path = str(binary.resolve())
+    assert run.call_args_list == [
+        call(
+            ["codesign", "--verify", "--strict", "--verbose=3", binary_path],
+            capture_output=True,
+            text=True,
+            check=False,
+        ),
+        call(["codesign", "-dvvv", binary_path], capture_output=True, text=True, check=False),
+    ]
 
 
 def test_codex_discoverer_discovers_plugin_mcp_camel_wrapped(tmp_path):
